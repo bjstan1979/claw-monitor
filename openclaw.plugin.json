@@ -19,6 +19,10 @@
         "maximum": 60,
         "default": 5
       },
+      "requireIdleConfirmation": {
+        "type": "boolean",
+        "default": true
+      },
       "maxWatchLines": {
         "type": "number",
         "minimum": 10,

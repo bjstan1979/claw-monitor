@@ -125,6 +125,7 @@ function formatElapsed(ms) {
 function getConfig(pluginConfig) {
   return {
     stuckThresholdMs: (pluginConfig?.stuckThresholdMinutes || 5) * 60000,
+    requireIdleConfirmation: pluginConfig?.requireIdleConfirmation !== false,
     maxWatchLines: pluginConfig?.maxWatchLines || 200,
     costAlertThresholdUsd: pluginConfig?.costAlertThresholdUsd || 5,
     tokenAlertThreshold: pluginConfig?.tokenAlertThreshold || 100000,
@@ -229,6 +230,172 @@ function parseJsonlEvents(filePath, maxLines) {
     return events;
   } catch {}
   return [];
+}
+
+function readRecentJsonlEvents(filePath, maxLines, maxBytes = 256 * 1024) {
+  try {
+    const stat = fs.statSync(filePath);
+    const start = Math.max(0, stat.size - maxBytes);
+    const fd = fs.openSync(filePath, "r");
+    try {
+      const buffer = Buffer.alloc(stat.size - start);
+      fs.readSync(fd, buffer, 0, buffer.length, start);
+      const content = buffer.toString("utf-8");
+      const lines = content.split("\n").filter(l => l.trim()).slice(-(maxLines || 80));
+      const events = [];
+      for (const line of lines) {
+        try { events.push(JSON.parse(line)); } catch {}
+      }
+      return events;
+    } finally {
+      fs.closeSync(fd);
+    }
+  } catch {}
+  return [];
+}
+
+function findTrajectoryFile(jsonlPath) {
+  const candidates = [
+    `${jsonlPath}.trajectory`,
+    `${jsonlPath}.trajectory.jsonl`,
+    jsonlPath.replace(/\.jsonl$/, ".trajectory.jsonl"),
+    jsonlPath.replace(/\.jsonl$/, ".trajectory"),
+  ];
+  return candidates.find(candidate => candidate && fs.existsSync(candidate)) || null;
+}
+
+function isModelGeneratingFromTrajectory(trajectoryEvents) {
+  // The trajectory file records prompt.submitted when a model call starts
+  // and model.completed when it finishes. If submitted > completed, the
+  // model is actively generating a response.
+  let submitted = 0;
+  let completed = 0;
+  for (const evt of trajectoryEvents) {
+    if (evt?.type === "prompt.submitted") submitted++;
+    else if (evt?.type === "model.completed") completed++;
+  }
+  return submitted > completed;
+}
+
+function isSessionProcessAlive(filePath) {
+  // Check if the .lock file exists and the PID is still running
+  try {
+    const lockPath = `${filePath}.lock`;
+    if (!fs.existsSync(lockPath)) return false;
+    const lockData = JSON.parse(fs.readFileSync(lockPath, "utf-8"));
+    if (!lockData.pid) return false;
+    // Signal 0 checks if process exists without killing it
+    try {
+      process.kill(lockData.pid, 0);
+      return true;
+    } catch {
+      return false; // Process not running
+    }
+  } catch {
+    return false;
+  }
+}
+
+function getLastMeaningfulTranscriptEvent(events) {
+  for (let i = events.length - 1; i >= 0; i--) {
+    const evt = events[i];
+    if (evt?.type !== "message" || !evt.message) continue;
+    const msg = evt.message;
+    if (msg.role === "assistant") {
+      if (Array.isArray(msg.content) && msg.content.some(block => block?.type === "tool_use" || block?.type === "toolCall")) {
+        return { type: "tool_call", event: evt };
+      }
+      return { type: "assistant_message", event: evt };
+    }
+    if (msg.role === "toolResult" || msg.role === "tool_result") return { type: "tool_result", event: evt };
+    if (msg.role === "user") return { type: "user_message", event: evt };
+  }
+  return null;
+}
+
+function confirmIdleBeforeStuckAlert(sessionKey, entry, filePath, staleMs, config) {
+  if (!config.requireIdleConfirmation) {
+    return { shouldAlert: true, level: "critical", reason: "idle confirmation disabled" };
+  }
+
+  try {
+    // 1. Check sessions.json for terminal status
+    const meta = getSessionMetaFromSessionsJson(sessionKey);
+    if (meta && isTerminalSessionStatus(meta.status, meta.endedAt)) {
+      return { shouldAlert: false, level: "info", reason: `session already terminal (${meta.status || "ended"})` };
+    }
+
+    // 2. Check if sessions.json says "running" — strong signal
+    const status = typeof meta?.status === "string" ? meta.status.toLowerCase() : "";
+    const sessionStoreSaysRunning = status === "running";
+
+    // 3. Check trajectory file for model generation state
+    //    When prompt.submitted count > model.completed count, model is actively generating.
+    //    This is the most reliable signal for "model is producing a long response".
+    const trajectoryFile = findTrajectoryFile(filePath);
+    const trajectoryEvents = trajectoryFile ? readRecentJsonlEvents(trajectoryFile, 200) : [];
+    const modelIsGenerating = isModelGeneratingFromTrajectory(trajectoryEvents);
+
+    // 4. Check if the session process is still alive (via .lock file PID)
+    const processAlive = isSessionProcessAlive(filePath);
+
+    // 5. Check last meaningful transcript event
+    const transcriptEvents = readRecentJsonlEvents(filePath, 80);
+    const lastEvent = getLastMeaningfulTranscriptEvent(transcriptEvents);
+
+    // Decision logic:
+    // - If model is actively generating (trajectory says so), suppress STUCK alert.
+    //   This is the primary fix for false STUCK alerts during long model generation.
+    if (modelIsGenerating) {
+      return {
+        shouldAlert: false,
+        level: "warning",
+        reason: `mtime stale for ${formatElapsed(staleMs)}, but trajectory shows model is actively generating (prompt.submitted > model.completed)`
+      };
+    }
+
+    // - If the session process is alive and the last event is tool_result or user_message
+    //   (i.e., waiting for assistant response), the model may be generating but the
+    //   trajectory hasn't been updated yet. Suppress with lower confidence.
+    const waitingForAssistant =
+      lastEvent?.type === "tool_result" ||
+      lastEvent?.type === "user_message";
+    if (processAlive && waitingForAssistant) {
+      return {
+        shouldAlert: false,
+        level: "warning",
+        reason: `mtime stale for ${formatElapsed(staleMs)}, but process alive and waiting for assistant response`
+      };
+    }
+
+    // - If sessions.json says "running" and process is alive, give benefit of doubt
+    //   but with a time limit (2x threshold = definitely stuck)
+    if (sessionStoreSaysRunning && processAlive && staleMs < config.stuckThresholdMs * 2) {
+      return {
+        shouldAlert: false,
+        level: "warning",
+        reason: `mtime stale for ${formatElapsed(staleMs)}, but session status=running and process alive (grace period)`
+      };
+    }
+
+    // - If process is dead, this is a genuine stuck/orphan
+    if (!processAlive) {
+      return {
+        shouldAlert: true,
+        level: "critical",
+        reason: `confirmed stuck; process dead, status=${status || "unknown"}, lastEvent=${lastEvent?.type || "unknown"}`
+      };
+    }
+
+    return {
+      shouldAlert: true,
+      level: "critical",
+      reason: `confirmed idle; status=${status || "unknown"}, lastEvent=${lastEvent?.type || "unknown"}, processAlive=${processAlive}`
+    };
+  } catch (err) {
+    debugLog(`idle confirmation failed for ${sessionKey}: ${err instanceof Error ? err.message : String(err)}`);
+    return { shouldAlert: true, level: "critical", reason: "idle confirmation failed" };
+  }
 }
 
 function extractUserMessageStats(events) {
@@ -1300,6 +1467,8 @@ function createSubagentWatchTool(config) {
       const lastActivityMs = stat.mtimeMs;
       const staleMs = now - lastActivityMs;
       const isStuck = staleMs > config.stuckThresholdMs;
+      const idleConfirmation = isStuck ? confirmIdleBeforeStuckAlert(sessionKey, null, filePath, staleMs, config) : null;
+      const confirmedStuck = isStuck && (idleConfirmation?.shouldAlert !== false);
 
 	      const events = parseJsonlEvents(filePath, maxLines);
 	      const extracted = extractActivity(events, detail);
@@ -1311,7 +1480,9 @@ function createSubagentWatchTool(config) {
         sessionId,
         lastActivity: new Date(lastActivityMs).toISOString(),
         staleFor: formatElapsed(staleMs),
-        isStuck,
+        isStuck: confirmedStuck,
+        isStuckRaw: isStuck,
+        stuckSuppressedReason: idleConfirmation && !idleConfirmation.shouldAlert ? idleConfirmation.reason : null,
         stuckThreshold: `${config.stuckThresholdMs / 60000} minutes with no activity`,
 	        totalEvents: events.length,
 	        showingLines: events.length,
@@ -2215,11 +2386,18 @@ async function checkAlerts(config, logger) {
         const stat = fs.statSync(filePath);
         const staleMs = now - stat.mtimeMs;
         if (staleMs > config.stuckThresholdMs && !entry._stuckAlerted) {
-          await pushAlert("critical", key,
-            `Subagent "${entry.label || entry.agentId}" (${key}) appears STUCK — no activity for ${formatElapsed(staleMs)}. Last tool: check with subagent_watch. Consider subagent_kill or subagent_steer.`
-          );
-          entry._stuckAlerted = true;
-          logger.info(`[claw-monitor] Stuck alert pushed: ${key}`);
+          const idleConfirmation = confirmIdleBeforeStuckAlert(key, entry, filePath, staleMs, config);
+          if (idleConfirmation.shouldAlert) {
+            await pushAlert(idleConfirmation.level, key,
+              `Subagent "${entry.label || entry.agentId}" (${key}) appears STUCK — no activity for ${formatElapsed(staleMs)}. Last tool: check with subagent_watch. Consider subagent_kill or subagent_steer.`
+            );
+            entry._stuckAlerted = true;
+            logger.info(`[claw-monitor] Stuck alert pushed: ${key} (${idleConfirmation.reason})`);
+          } else {
+            entry._stuckAlerted = false;
+            entry._lastStuckSuppressedAt = now;
+            logger.info(`[claw-monitor] Stuck alert suppressed: ${key} (${idleConfirmation.reason})`);
+          }
         }
         if (staleMs <= config.stuckThresholdMs) {
           entry._stuckAlerted = false;
@@ -2608,7 +2786,11 @@ module.exports = definePluginEntry({
           try {
             const stat = fs.statSync(filePath);
             staleMs = now - stat.mtimeMs;
-            if (staleMs > config.stuckThresholdMs) isStuck = true;
+            if (staleMs > config.stuckThresholdMs) {
+              // Use the same idle confirmation logic as the alert path
+              const idleConfirmation = confirmIdleBeforeStuckAlert(key, entry, filePath, staleMs, config);
+              isStuck = idleConfirmation.shouldAlert;
+            }
           } catch {}
         }
         if (isStuck) {
