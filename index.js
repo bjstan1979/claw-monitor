@@ -893,6 +893,7 @@ function inferProgressFromJsonl(jsonlPath, taskDescription) {
   if (uniqueSteps.length >= 2) {
     const completedSteps = [];
     const remainingSteps = [];
+    // Steps with explicit completion markers are definitely done
     for (const s of uniqueSteps) {
       if (completedNums.has(s.num)) {
         completedSteps.push(s.desc);
@@ -900,9 +901,14 @@ function inferProgressFromJsonl(jsonlPath, taskDescription) {
         remainingSteps.push(s.desc);
       }
     }
-    // If no completion markers found, fall back to: all but last are completed
-    if (completedSteps.length === 0 && remainingSteps.length >= 2) {
-      completedSteps.push(...remainingSteps.slice(0, -1));
+    // The last step without a completion marker is the current step —
+    // the subagent is actively working on it, so count it as completed progress
+    if (remainingSteps.length === 1 && completedSteps.length > 0) {
+      completedSteps.push(remainingSteps.pop());
+    }
+    // If no completion markers found, all but the very last step are completed
+    if (completedSteps.length === 0 && uniqueSteps.length >= 2) {
+      completedSteps.push(...uniqueSteps.slice(0, -1).map(s => s.desc));
       remainingSteps.length = 0;
       remainingSteps.push(uniqueSteps[uniqueSteps.length - 1].desc);
     }
