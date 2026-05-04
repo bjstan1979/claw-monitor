@@ -1332,15 +1332,12 @@ function updateIntermediateCheckpoint(key, entry, now = Date.now(), force = fals
     // its writtenFiles/readFiles/etc. fields written out
     const taskDesc = entry.task || entry.label || "";
     const inferred = inferProgressFromJsonl(jsonlPath, taskDesc);
-    console.error(`[claw-monitor] inferProgress: key=${key.slice(-20)} completedSteps=${JSON.stringify(inferred.completedSteps)} remainingSteps=${JSON.stringify(inferred.remainingSteps)} lastToolCall=${inferred.lastToolCall}`);
     // If we already have steps from a previous refresh, only update if the new
     // inference is consistent (same strategy) — avoid strategy-switching duplicates
     const hasExistingSteps = (intermediateProgress.completedSteps?.length || 0) > 0;
     if (inferred.completedSteps.length > 0) {
       if (!hasExistingSteps || stepsAreConsistent(intermediateProgress.completedSteps, inferred.completedSteps)) {
         intermediateProgress.completedSteps = inferred.completedSteps;
-      } else {
-        console.error(`[claw-monitor] stepsAreConsistent=false, keeping existing: ${JSON.stringify(intermediateProgress.completedSteps)}`);
       }
     }
     // Always update remainingSteps — when task completes, inferred.remainingSteps=[]
