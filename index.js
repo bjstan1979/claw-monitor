@@ -134,6 +134,31 @@ function getConfig(pluginConfig) {
   };
 }
 
+function extractTextContent(content) {
+  if (!content) return "";
+  if (typeof content === "string") return content;
+  if (!Array.isArray(content)) return "";
+  return content
+    .map(block => {
+      if (!block) return "";
+      if (typeof block === "string") return block;
+      if (block.type === "text" && typeof block.text === "string") return block.text;
+      if (typeof block.content === "string") return block.content;
+      return "";
+    })
+    .filter(Boolean)
+    .join(" ");
+}
+
+function isOpenClawInjectedUserMessage(text) {
+  return text.includes("[Subagent Context]") ||
+    text.includes("You are running as a subagent") ||
+    text.startsWith("[Claw Monitor") ||
+    text.startsWith("[CLAW-MONITOR") ||
+    text.startsWith("[Pipeline") ||
+    text.startsWith("[Checkpoint ");
+}
+
 function debugLog(message) {
   if (process.env.CLAW_MONITOR_DEBUG === "1") {
     console.error(`[claw-monitor] ${message}`);
@@ -160,14 +185,10 @@ function extractTaskFromJsonl(filePath) {
         if (evt.type === "message" && evt.message) {
           const msg = evt.message;
           if (msg.role === "user" && msg.content) {
-            const text = typeof msg.content === "string"
-              ? msg.content
-              : Array.isArray(msg.content)
-                ? msg.content.filter(b => b.type === "text").map(b => b.text).join(" ")
-                : "";
+            const text = extractTextContent(msg.content);
             if (text.trim()) {
               // Skip OpenClaw-injected subagent context messages
-              if (text.includes("[Subagent Context]") || text.includes("You are running as a subagent")) {
+              if (isOpenClawInjectedUserMessage(text)) {
                 continue;
               }
               return text.trim().slice(0, 200);
@@ -183,11 +204,7 @@ function extractTaskFromJsonl(filePath) {
         if (evt.type === "message" && evt.message) {
           const msg = evt.message;
           if (msg.role === "assistant" && msg.content) {
-            const text = typeof msg.content === "string"
-              ? msg.content
-              : Array.isArray(msg.content)
-                ? msg.content.filter(b => b.type === "text").map(b => b.text).join(" ")
-                : "";
+            const text = extractTextContent(msg.content);
             if (text.trim().length > 10) {
               return text.trim().slice(0, 200);
             }
@@ -214,6 +231,26 @@ function parseJsonlEvents(filePath, maxLines) {
   return [];
 }
 
+function extractUserMessageStats(events) {
+  const userMessages = [];
+  for (const evt of events) {
+    if (evt.type !== "message" || !evt.message || evt.message.role !== "user") continue;
+    const text = extractTextContent(evt.message.content).trim();
+    if (!text || isOpenClawInjectedUserMessage(text)) continue;
+    userMessages.push({
+      ts: evt.timestamp || "",
+      text,
+    });
+  }
+  const last = userMessages[userMessages.length - 1] || null;
+  return {
+    hasUserInput: userMessages.length > 0,
+    userInputCount: userMessages.length,
+    lastUserMessage: last ? last.text.slice(0, 200) : null,
+    lastUserMessageAt: last ? last.ts : null,
+  };
+}
+
 // Extract activity from events
 function extractActivity(events, detail) {
   const activity = [];
@@ -230,6 +267,13 @@ function extractActivity(events, detail) {
     if (evt.type === "message" && evt.message) {
       const msg = evt.message;
       const ts = evt.timestamp || "";
+
+      if (msg.role === "user") {
+        const text = extractTextContent(msg.content).trim();
+        if (text && !isOpenClawInjectedUserMessage(text) && (detail === "full" || detail === "summary")) {
+          activity.push({ ts, type: "user_message", text: text.slice(0, 500) });
+        }
+      }
 
       if (msg.role === "assistant" && Array.isArray(msg.content)) {
         for (const block of msg.content) {
@@ -430,6 +474,7 @@ function isCommandSafe(cmd) {
 function generateRunSummary(filePath, tracked) {
   const events = parseJsonlEvents(filePath, 500);
   const extracted = extractActivity(events, "summary");
+  const userStats = extractUserMessageStats(events);
   const writtenFiles = [];
   const editedFiles = [];
   const readFiles = [];
@@ -481,6 +526,7 @@ function generateRunSummary(filePath, tracked) {
     elapsed,
     cost,
     tokens: extracted.totalTokens || 0,
+    userStats,
   };
 }
 
@@ -812,6 +858,15 @@ function updateIntermediateCheckpoint(key, entry, now = Date.now(), force = fals
     intermediateProgress.lastError = entry.error || intermediateProgress.lastError || null;
     entry.totalCostUsd = summary.cost || entry.totalCostUsd || 0;
     entry.totalTokens = summary.tokens || entry.totalTokens || 0;
+    entry.userStats = summary.userStats || entry.userStats || null;
+  }
+
+  const metadata = { ...(entry.metadata || {}) };
+  if (entry.userStats?.hasUserInput) {
+    metadata.hasUserInput = true;
+    metadata.userInputCount = entry.userStats.userInputCount;
+    metadata.lastUserMessage = entry.userStats.lastUserMessage;
+    metadata.lastUserMessageAt = entry.userStats.lastUserMessageAt;
   }
 
   writeCheckpoint(key, {
@@ -825,7 +880,7 @@ function updateIntermediateCheckpoint(key, entry, now = Date.now(), force = fals
     type: "intermediate",
     outcome: "running",
     progress: intermediateProgress,
-    metadata: entry.metadata || {}
+    metadata
   });
   return true;
 }
@@ -900,11 +955,19 @@ async function finalizeSubagentCheckpoint(key, entry, api, options = {}) {
       completedSteps: [],
       remainingSteps: []
     };
+    entry.userStats = runSummary.userStats || entry.userStats || null;
   }
   if (fileChanges) {
     checkpoint.progress = checkpoint.progress || createEmptyProgress();
     checkpoint.progress.writtenFiles = [...(checkpoint.progress.writtenFiles || []), ...fileChanges.created];
     checkpoint.progress.editedFiles = [...(checkpoint.progress.editedFiles || []), ...fileChanges.modified];
+  }
+  checkpoint.metadata = { ...(checkpoint.metadata || {}), ...(entry.metadata || {}) };
+  if (entry.userStats?.hasUserInput) {
+    checkpoint.metadata.hasUserInput = true;
+    checkpoint.metadata.userInputCount = entry.userStats.userInputCount;
+    checkpoint.metadata.lastUserMessage = entry.userStats.lastUserMessage;
+    checkpoint.metadata.lastUserMessageAt = entry.userStats.lastUserMessageAt;
   }
   writeCheckpoint(key, checkpoint);
 
@@ -1094,6 +1157,10 @@ function createSubagentStatusTool(config) {
           error: entry.error || null,
           totalCostUsd: entry.totalCostUsd || null,
           totalTokens: entry.totalTokens || null,
+          hasUserInput: entry.userStats?.hasUserInput || metadata.hasUserInput || false,
+          userInputCount: entry.userStats?.userInputCount || metadata.userInputCount || 0,
+          lastUserMessage: entry.userStats?.lastUserMessage || metadata.lastUserMessage || null,
+          lastUserMessageAt: entry.userStats?.lastUserMessageAt || metadata.lastUserMessageAt || null,
           progress: progress,
           expectedDuration: metadata.expectedDuration || null,
           successCriteria: metadata.successCriteria || null,
@@ -1127,6 +1194,7 @@ function createSubagentStatusTool(config) {
               const jsonlStatus = val.status; // "done", "failed", "timeout", or undefined for running
               const isActive = !val.endedAt && !jsonlStatus;
               const task = filePath ? (extractTaskFromJsonl(filePath) || val.label || "(discovered from sessions.json)") : (val.label || "(no transcript)");
+              const userStats = filePath ? extractUserMessageStats(parseJsonlEvents(filePath, 500)) : null;
               allRuns.push({
                 childSessionKey: key,
                 agentId,
@@ -1140,6 +1208,10 @@ function createSubagentStatusTool(config) {
                 error: jsonlStatus === "failed" ? "failed" : (jsonlStatus === "timeout" ? "timeout" : null),
                 totalCostUsd: val.estimatedCostUsd || null,
                 totalTokens: val.totalTokens || null,
+                hasUserInput: userStats?.hasUserInput || false,
+                userInputCount: userStats?.userInputCount || 0,
+                lastUserMessage: userStats?.lastUserMessage || null,
+                lastUserMessageAt: userStats?.lastUserMessageAt || null,
                 progress: null,
                 expectedDuration: null,
                 successCriteria: null,
@@ -1229,10 +1301,11 @@ function createSubagentWatchTool(config) {
       const staleMs = now - lastActivityMs;
       const isStuck = staleMs > config.stuckThresholdMs;
 
-      const events = parseJsonlEvents(filePath, maxLines);
-      const extracted = extractActivity(events, detail);
-
-      const result = {
+	      const events = parseJsonlEvents(filePath, maxLines);
+	      const extracted = extractActivity(events, detail);
+	      const userStats = extractUserMessageStats(events);
+	
+	      const result = {
         sessionKey,
         agentId,
         sessionId,
@@ -1240,21 +1313,25 @@ function createSubagentWatchTool(config) {
         staleFor: formatElapsed(staleMs),
         isStuck,
         stuckThreshold: `${config.stuckThresholdMs / 60000} minutes with no activity`,
-        totalEvents: events.length,
-        showingLines: events.length,
-      };
+	        totalEvents: events.length,
+	        showingLines: events.length,
+	        userMessages: userStats,
+	      };
 
       if (detail === "digest") {
-        result.digest = generateDigest(
+	        result.digest = generateDigest(
           extracted.toolCallCounts,
           extracted.lastToolInput,
           extracted.lastToolName,
           extracted.retryCount,
           events.length
-        );
-      } else {
-        result.activity = extracted.activity;
-      }
+	        );
+	        if (userStats.hasUserInput) {
+	          result.digest += ` 检测到${userStats.userInputCount}条用户消息，最后一条: "${userStats.lastUserMessage}"。`;
+	        }
+	      } else {
+	        result.activity = extracted.activity;
+	      }
 
       result.costSummary = {
         totalCostUsd: extracted.totalCost ? extracted.totalCost.toFixed(4) : null,
@@ -1264,10 +1341,11 @@ function createSubagentWatchTool(config) {
 
       // Update tracker with cost info
       const tracked = subagentTracker.get(sessionKey);
-      if (tracked) {
-        tracked.totalCostUsd = extracted.totalCost || 0;
-        tracked.totalTokens = extracted.totalTokens || 0;
-      }
+	      if (tracked) {
+	        tracked.totalCostUsd = extracted.totalCost || 0;
+	        tracked.totalTokens = extracted.totalTokens || 0;
+	        tracked.userStats = userStats;
+	      }
 
       return {
         content: [{ type: "text", text: JSON.stringify(result, null, 2) }],
@@ -1560,11 +1638,12 @@ function createSubagentSearchTool() {
             for (const [key, val] of Object.entries(mapping)) {
               if (subagentTracker.has(key)) continue;
               if (!key.startsWith("agent:")) continue;
-              const sessionId = val.sessionId;
-              if (!sessionId) continue;
-              const filePath = findJsonlFile(agentId, sessionId);
-              const task = filePath ? (extractTaskFromJsonl(filePath) || val.label || "") : (val.label || "");
-              const searchable = `${task} ${agentId} ${key}`.toLowerCase();
+	              const sessionId = val.sessionId;
+	              if (!sessionId) continue;
+	              const filePath = findJsonlFile(agentId, sessionId);
+	              const task = filePath ? (extractTaskFromJsonl(filePath) || val.label || "") : (val.label || "");
+	              const userStats = filePath ? extractUserMessageStats(parseJsonlEvents(filePath, 500)) : null;
+	              const searchable = `${task} ${agentId} ${key}`.toLowerCase();
               if (searchable.includes(query)) {
                 const jsonlStatus = val.status;
                 const isActive = !val.endedAt && !jsonlStatus;
@@ -1576,11 +1655,15 @@ function createSubagentSearchTool() {
                   task: task || "(no description)",
                   parentSessionKey: val.spawnedBy || null,
                   status: isActive ? "running" : (jsonlStatus || "ended"),
-                  startedAt: val.startedAt ? new Date(val.startedAt).toISOString() : null,
-                  elapsed: val.runtimeMs ? formatElapsed(val.runtimeMs) : "n/a",
-                  error: jsonlStatus === "failed" ? "failed" : (jsonlStatus === "timeout" ? "timeout" : null),
-                  source: "sessions.json"
-                });
+	                  startedAt: val.startedAt ? new Date(val.startedAt).toISOString() : null,
+	                  elapsed: val.runtimeMs ? formatElapsed(val.runtimeMs) : "n/a",
+	                  error: jsonlStatus === "failed" ? "failed" : (jsonlStatus === "timeout" ? "timeout" : null),
+	                  hasUserInput: userStats?.hasUserInput || false,
+	                  userInputCount: userStats?.userInputCount || 0,
+	                  lastUserMessage: userStats?.lastUserMessage || null,
+	                  lastUserMessageAt: userStats?.lastUserMessageAt || null,
+	                  source: "sessions.json"
+	                });
               }
             }
           }
