@@ -1,0 +1,73 @@
+{
+  "id": "claw-monitor",
+  "activation": {
+    "onStartup": true
+  },
+  "name": "Claw Monitor",
+  "description": "Gives the main agent real-time visibility into subagent execution: status, transcript watching, kill control, proactive alerts, progress tracking, and steering.",
+  "configSchema": {
+    "type": "object",
+    "additionalProperties": false,
+    "properties": {
+      "enabled": {
+        "type": "boolean",
+        "default": true
+      },
+      "stuckThresholdMinutes": {
+        "type": "number",
+        "minimum": 1,
+        "maximum": 60,
+        "default": 5
+      },
+      "maxWatchLines": {
+        "type": "number",
+        "minimum": 10,
+        "maximum": 500,
+        "default": 200
+      },
+      "costAlertThresholdUsd": {
+        "type": "number",
+        "minimum": 0.1,
+        "maximum": 100,
+        "default": 5
+      },
+      "tokenAlertThreshold": {
+        "type": "number",
+        "minimum": 1000,
+        "maximum": 1000000,
+        "default": 100000
+      },
+      "alertCheckIntervalSeconds": {
+        "type": "number",
+        "minimum": 10,
+        "maximum": 300,
+        "default": 30
+      },
+      "checkpointRefreshIntervalSeconds": {
+        "type": "number",
+        "minimum": 10,
+        "maximum": 300,
+        "default": 60
+      },
+      "orphanGraceMinutes": {
+        "type": "number",
+        "minimum": 5,
+        "maximum": 1440,
+        "default": 60
+      }
+    }
+  },
+  "contracts": {
+    "tools": [
+      "subagent_status",
+      "subagent_watch",
+      "subagent_kill",
+      "subagent_progress",
+      "subagent_search",
+      "subagent_steer",
+      "subagent_on_alert",
+      "subagent_pipeline",
+      "subagent_checkpoint"
+    ]
+  }
+}
