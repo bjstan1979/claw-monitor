@@ -1337,9 +1337,9 @@ function updateIntermediateCheckpoint(key, entry, now = Date.now(), force = fals
         console.error(`[claw-monitor] stepsAreConsistent=false, keeping existing: ${JSON.stringify(intermediateProgress.completedSteps)}`);
       }
     }
-    if (inferred.remainingSteps.length > 0) {
-      intermediateProgress.remainingSteps = inferred.remainingSteps;
-    }
+    // Always update remainingSteps — when task completes, inferred.remainingSteps=[]
+    // must overwrite the stale ["撰写产出"] from a previous tick
+    intermediateProgress.remainingSteps = inferred.remainingSteps;
     if (inferred.lastToolCall) {
       intermediateProgress.lastToolCall = inferred.lastToolCall;
     }
