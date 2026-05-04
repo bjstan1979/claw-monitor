@@ -2608,6 +2608,7 @@ function createAlertCheckerService(config, logger) {
       logger.info("[claw-monitor] Alert checker starting");
       intervalHandle = setInterval(() => {
         try {
+          logger.info("[claw-monitor] Alert checker tick");
           checkAlerts(config, logger);
         } catch (err) {
           logger.warn(`[claw-monitor] Alert checker error: ${err instanceof Error ? err.message : String(err)}`);
@@ -2768,6 +2769,7 @@ function createCheckpointRefreshService(config, logger) {
       intervalHandle = setInterval(async () => {
         try {
           const now = Date.now();
+          logger.info(`[claw-monitor] Checkpoint refresh tick (tracked=${subagentTracker.size}, now=${now})`);
           discoverRunningSubagentsFromSessionsJson(config, logger);
           await finalizeEndedSessionsFromSessionsJson(config, logger, apiRef);
           pruneStaleTrackedSubagents(config, logger);
