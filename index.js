@@ -772,24 +772,81 @@ function inferProgressFromJsonl(jsonlPath, taskDescription) {
     }
   }
 
+  // Phase A: Count total steps from "开始第X步" / "第X步完成" markers
+  // This works even when steps have no inline description
+  const stepCountRegex = /第([一二三四五六七八九十\d]+)步/g;
+  const stepNumsSeen = new Set();
+  for (const text of assistantTexts) {
+    let m;
+    while ((m = stepCountRegex.exec(text)) !== null) {
+      stepNumsSeen.add(m[1]);
+    }
+  }
+  const cnNumMap = {"一":"1","二":"2","三":"3","四":"4","五":"5","六":"6","七":"7","八":"8","九":"9","十":"10"};
+  function normalizeStepNum(n) { return cnNumMap[n] || n; }
+  const totalStepNums = [...stepNumsSeen].map(normalizeStepNum);
+
+  // Phase B: Extract steps with descriptions from "第X步：描述" or "第X步 描述"
   const stepRegex = /(?:第([一二三四五六七八九十\d]+)[步步骤]|[Ss]tep\s*(\d+)|[Pp]hase\s*(\d+))\s*[:：]?\s*([^\n。；;]{2,80})/g;
   const foundSteps = [];
-  // Patterns that indicate a completion/status line, not a step declaration
   const completionNoiseRe = /^(?:搜索|查询|分析)?\s*(?:已\s*)?完成|，接下来|，全部任务/;
   for (const text of assistantTexts) {
     let match;
     while ((match = stepRegex.exec(text)) !== null) {
       const stepNum = match[1] || match[2] || match[3];
       let stepDesc = match[4].trim();
-      // Clean markdown and status markers from step description
       stepDesc = stepDesc.replace(/\*\*/g, "").replace(/✅\s*完成\s*\|?/g, "").replace(/⏳\s*进行中\s*\|?/g, "").replace(/\|\s*/g, " ").trim();
-      // Remove leading colon/punctuation and trailing em-dash explanations
       stepDesc = stepDesc.replace(/^[：:]\s*/, "").replace(/\s*[—–-]\s*.+$/, "").trim();
-      // Remove trailing file path references like "到 `/path/to/file`，..."
       stepDesc = stepDesc.replace(/\s*(?:到|至)?\s*`[^`]*`.*$/, "").trim();
-      // Skip completion status lines that got captured as step descriptions
       if (!stepDesc || stepDesc.length < 2 || completionNoiseRe.test(stepDesc)) continue;
       foundSteps.push({ num: stepNum, desc: stepDesc });
+    }
+  }
+
+  // Phase C: If we found step markers but no descriptions, try to map step numbers
+  // to tool phases from the conversation. e.g. step 1 → web_search → "搜索"
+  if (foundSteps.length < 2 && totalStepNums.length >= 2) {
+    // Build a mapping of step number → tool phase from "开始第X步" context
+    // Look for tool calls that appear between step markers
+    const stepToolMap = new Map();
+    let currentStep = null;
+    for (const evt of earlyEvents) {
+      if (evt.type !== "message" || !evt.message) continue;
+      const msg = evt.message;
+      // Track which step we're in from assistant text
+      if (msg.role === "assistant") {
+        const text = extractTextContent(msg.content).trim();
+        const stepMarker = text.match(/第([一二三四五六七八九十\d]+)步/);
+        if (stepMarker) {
+          const num = normalizeStepNum(stepMarker[1]);
+          if (!currentStep || currentStep !== num) {
+            currentStep = num;
+          }
+        }
+      }
+      // Track tool calls within each step
+      if (msg.role === "assistant" && Array.isArray(msg.content)) {
+        for (const block of msg.content) {
+          if ((block.type === "tool_use" || block.type === "toolCall") && currentStep) {
+            const phase = TOOL_PHASE_MAP[block.name || "unknown"];
+            if (phase && !stepToolMap.has(currentStep)) {
+              stepToolMap.set(currentStep, phase);
+            }
+          }
+        }
+      }
+    }
+    // Deduplicate phase names by appending count suffix when same phase repeats
+    const phaseCount = new Map();
+    for (const num of totalStepNums.sort((a, b) => parseInt(a) - parseInt(b))) {
+      const existing = foundSteps.find(s => normalizeStepNum(s.num) === num);
+      if (!existing) {
+        let desc = stepToolMap.get(num) || `步骤${num}`;
+        const count = (phaseCount.get(desc) || 0) + 1;
+        phaseCount.set(desc, count);
+        if (count > 1) desc = desc + count;
+        foundSteps.push({ num, desc });
+      }
     }
   }
 
@@ -811,9 +868,6 @@ function inferProgressFromJsonl(jsonlPath, taskDescription) {
   }
 
   // Deduplicate explicit steps by step number and description overlap
-  // Normalize Chinese numerals to Arabic so "第一步" and "第1步" merge
-  const cnNumMap = {"一":"1","二":"2","三":"3","四":"4","五":"5","六":"6","七":"7","八":"8","九":"9","十":"10"};
-  function normalizeStepNum(n) { return cnNumMap[n] || n; }
   const uniqueSteps = [];
   for (const s of foundSteps) {
     const normNum = normalizeStepNum(s.num);
