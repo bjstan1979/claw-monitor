@@ -12,6 +12,7 @@ let mainSessionKey = null; // track main agent's session key
 let apiRef = null; // reference to plugin API for push alerts
 const agentHealthStats = new Map(); // agentId -> { runs: [{outcome, duration, cost, error}] }
 const retryCounter = new Map(); // sessionKey -> retry count for auto-retry
+let pendingRestartNotification = null; // deferred restart notification text, injected once mainSessionKey is captured
 
 // --- Helpers ---
 function resolveOpenclawDir() {
@@ -130,7 +131,7 @@ function getConfig(pluginConfig) {
     costAlertThresholdUsd: pluginConfig?.costAlertThresholdUsd || 5,
     tokenAlertThreshold: pluginConfig?.tokenAlertThreshold || 100000,
     alertCheckIntervalMs: (pluginConfig?.alertCheckIntervalSeconds || 30) * 1000,
-    checkpointRefreshIntervalMs: (pluginConfig?.checkpointRefreshIntervalSeconds || 60) * 1000,
+    checkpointRefreshIntervalMs: (pluginConfig?.checkpointRefreshIntervalSeconds || 15) * 1000,
     orphanGraceMs: (pluginConfig?.orphanGraceMinutes || 60) * 60000,
   };
 }
@@ -250,6 +251,21 @@ function readRecentJsonlEvents(filePath, maxLines, maxBytes = 256 * 1024) {
     } finally {
       fs.closeSync(fd);
     }
+  } catch {}
+  return [];
+}
+
+// Read the FIRST maxLines from a JSONL file (for step-plan extraction).
+// Step declarations appear early and throughout, not just at the end.
+function readEarlyJsonlEvents(filePath, maxLines) {
+  try {
+    const content = fs.readFileSync(filePath, "utf-8");
+    const lines = content.split("\n").filter(l => l.trim()).slice(0, maxLines || 200);
+    const events = [];
+    for (const line of lines) {
+      try { events.push(JSON.parse(line)); } catch {}
+    }
+    return events;
   } catch {}
   return [];
 }
@@ -637,7 +653,231 @@ function isCommandSafe(cmd) {
   return true;
 }
 
-// Generate end-of-run summary from JSONL transcript
+// --- Progress inference from JSONL transcript ---
+// Infers completedSteps and remainingSteps by analyzing recent
+// assistant messages, tool call sequences, and file operations.
+// This runs every checkpoint refresh interval (default 60s), so it must be lightweight.
+
+// Step keywords that indicate a phase transition in Chinese/English
+const STEP_INDICATOR_PATTERNS = [
+  // Chinese step markers
+  /第[一二三四五六七八九十\d]+[步步骤]/,
+  /步骤\s*\d/,
+  /首先|然后|接着|接下来|最后|最终/,
+  /已完成|完成[了了]?|已结束/,
+  /正在|当前|现在/,
+  /开始|启动|着手/,
+  // English step markers
+  /step\s*\d+/i,
+  /first|second|third|next|then|finally|lastly/i,
+  /phase\s*\d+/i,
+  /completed|finished|done/i,
+  /currently|now|in progress/i,
+  /starting|beginning/i,
+];
+
+// File path patterns that hint at task phase
+const FILE_PHASE_HINTS = [
+  { pattern: /search|调研|research|survey/i, phase: "搜索调研" },
+  { pattern: /draft|草稿|outline|大纲|初步/i, phase: "起草" },
+  { pattern: /final|最终|完成|output|result|报告/i, phase: "生成最终产出" },
+  { pattern: /test|测试|spec|验证/i, phase: "测试验证" },
+  { pattern: /review|审查|检查|校验/i, phase: "审查校验" },
+  { pattern: /summary|总结|摘要|synthesis/i, phase: "总结归纳" },
+  { pattern: /translate|翻译/i, phase: "翻译" },
+  { pattern: /format|格式化|排版/i, phase: "格式化排版" },
+];
+
+// Tool call to phase mapping
+const TOOL_PHASE_MAP = {
+  // Search/research phase
+  web_search: "搜索",
+  web_fetch: "获取网页内容",
+  tavily_search: "搜索",
+  tavily_extract: "提取网页内容",
+  browser: "浏览器操作",
+  // Reading/analysis phase
+  Read: "阅读文件",
+  read: "阅读文件",
+  pdf: "阅读PDF",
+  image: "分析图片",
+  // Writing/creation phase
+  Write: "写入文件",
+  write: "写入文件",
+  edit: "编辑文件",
+  Edit: "编辑文件",
+  image_generate: "生成图片",
+  video_generate: "生成视频",
+  music_generate: "生成音乐",
+  tts: "生成语音",
+  // Execution phase
+  exec: "执行命令",
+  Exec: "执行命令",
+  process: "管理进程",
+  // Communication
+  message: "发送消息",
+  sessions_send: "发送消息给其他agent",
+  sessions_spawn: "派生子agent",
+};
+
+// Check if two step lists come from the same inference strategy (consistent style).
+// Use intersection: if any step from existing appears in inferred, they're consistent.
+function stepsAreConsistent(existing, inferred) {
+  if (!existing?.length || !inferred?.length) return true;
+  const existingPrefixes = existing.map(s => s.toLowerCase().replace(/["""\s]/g, "").slice(0, 8));
+  const inferredPrefixes = inferred.map(s => s.toLowerCase().replace(/["""\s]/g, "").slice(0, 8));
+  return existingPrefixes.some(ep => inferredPrefixes.some(ip => ep === ip || ep.includes(ip) || ip.includes(ep)));
+}
+
+function inferProgressFromJsonl(jsonlPath, taskDescription) {
+  if (!jsonlPath || !fs.existsSync(jsonlPath)) {
+    return { completedSteps: [], remainingSteps: [], lastToolCall: null };
+  }
+
+  // Strategy 1 needs early messages (step plans are declared throughout but start early),
+  // Strategy 2 needs recent messages (tool calls happen in order).
+  const earlyEvents = readEarlyJsonlEvents(jsonlPath, 200);
+  const recentEvents = readRecentJsonlEvents(jsonlPath, 50, 128 * 1024);
+
+  let lastToolCall = null;
+  const toolPhaseOrder = [];
+  const toolPhaseSeen = new Set();
+
+  for (const evt of recentEvents) {
+    if (evt.type !== "message" || !evt.message) continue;
+    const msg = evt.message;
+    if (msg.role === "assistant" && Array.isArray(msg.content)) {
+      for (const block of msg.content) {
+        if (block.type === "tool_use" || block.type === "toolCall") {
+          const toolName = block.name || "unknown";
+          lastToolCall = toolName;
+          const phase = TOOL_PHASE_MAP[toolName];
+          if (phase && !toolPhaseSeen.has(phase)) {
+            toolPhaseSeen.add(phase);
+            toolPhaseOrder.push(phase);
+          }
+        }
+      }
+    }
+  }
+
+  // Strategy 1: Extract explicit step mentions from EARLY assistant messages
+  const assistantTexts = [];
+  for (const evt of earlyEvents) {
+    if (evt.type !== "message" || !evt.message) continue;
+    const msg = evt.message;
+    if (msg.role === "assistant") {
+      const text = extractTextContent(msg.content).trim();
+      if (text && text.length > 2) assistantTexts.push(text);
+    }
+  }
+
+  const stepRegex = /(?:第([一二三四五六七八九十\d]+)[步步骤]|[Ss]tep\s*(\d+)|[Pp]hase\s*(\d+))\s*[:：]?\s*([^\n。；;]{2,80})/g;
+  const foundSteps = [];
+  // Patterns that indicate a completion/status line, not a step declaration
+  const completionNoiseRe = /^(?:搜索|查询|分析)?\s*(?:已\s*)?完成|，接下来|，全部任务/;
+  for (const text of assistantTexts) {
+    let match;
+    while ((match = stepRegex.exec(text)) !== null) {
+      const stepNum = match[1] || match[2] || match[3];
+      let stepDesc = match[4].trim();
+      // Clean markdown and status markers from step description
+      stepDesc = stepDesc.replace(/\*\*/g, "").replace(/✅\s*完成\s*\|?/g, "").replace(/⏳\s*进行中\s*\|?/g, "").replace(/\|\s*/g, " ").trim();
+      // Remove leading colon/punctuation and trailing em-dash explanations
+      stepDesc = stepDesc.replace(/^[：:]\s*/, "").replace(/\s*[—–-]\s*.+$/, "").trim();
+      // Remove trailing file path references like "到 `/path/to/file`，..."
+      stepDesc = stepDesc.replace(/\s*(?:到|至)?\s*`[^`]*`.*$/, "").trim();
+      // Skip completion status lines that got captured as step descriptions
+      if (!stepDesc || stepDesc.length < 2 || completionNoiseRe.test(stepDesc)) continue;
+      foundSteps.push({ num: stepNum, desc: stepDesc });
+    }
+  }
+
+  // Detect which steps have explicit completion markers
+  // Matches: "第X步完成", "第X步已完成", "第X步...已完成", "已完成第X步"
+  const completedNums = new Set();
+  const completionPatterns = [
+    /第([一二三四五六七八九十\d]+)步\s*(?:已\s*)?完成/g,
+    /已完成第([一二三四五六七八九十\d]+)步/g,
+    /第([一二三四五六七八九十\d]+)步[^。\n]{0,20}已完成/g,
+  ];
+  for (const text of assistantTexts) {
+    for (const regex of completionPatterns) {
+      let match;
+      while ((match = regex.exec(text)) !== null) {
+        completedNums.add(match[1]);
+      }
+    }
+  }
+
+  // Deduplicate explicit steps by step number and description overlap
+  // Normalize Chinese numerals to Arabic so "第一步" and "第1步" merge
+  const cnNumMap = {"一":"1","二":"2","三":"3","四":"4","五":"5","六":"6","七":"7","八":"8","九":"9","十":"10"};
+  function normalizeStepNum(n) { return cnNumMap[n] || n; }
+  const uniqueSteps = [];
+  for (const s of foundSteps) {
+    const normNum = normalizeStepNum(s.num);
+    // Check if we already have a step with the same number
+    const existingIdx = uniqueSteps.findIndex(u => u.num === normNum);
+    if (existingIdx === -1) {
+      uniqueSteps.push({ ...s, num: normNum });
+    } else {
+      // Same step number: keep the one with a more descriptive (longer, action-oriented) description
+      const existing = uniqueSteps[existingIdx];
+      const existingHasAction = /^(?:搜索|查询|分析|撰写|综合|执行|运行|编写|实现|测试|创建|生成|读取|写入|编辑|安装|部署)/.test(existing.desc);
+      const newHasAction = /^(?:搜索|查询|分析|撰写|综合|执行|运行|编写|实现|测试|创建|生成|读取|写入|编辑|安装|部署)/.test(s.desc);
+      // Prefer action-oriented descriptions; if both, prefer shorter (cleaner)
+      if (newHasAction && !existingHasAction) {
+        uniqueSteps[existingIdx] = { ...s, num: normNum };
+      } else if (newHasAction && existingHasAction && s.desc.length < existing.desc.length) {
+        uniqueSteps[existingIdx] = { ...s, num: normNum };
+      }
+    }
+  }
+
+  // If we found 2+ explicit steps, use them with completion tracking
+  if (uniqueSteps.length >= 2) {
+    const completedSteps = [];
+    const remainingSteps = [];
+    for (const s of uniqueSteps) {
+      if (completedNums.has(s.num)) {
+        completedSteps.push(s.desc);
+      } else {
+        remainingSteps.push(s.desc);
+      }
+    }
+    // If no completion markers found, fall back to: all but last are completed
+    if (completedSteps.length === 0 && remainingSteps.length >= 2) {
+      completedSteps.push(...remainingSteps.slice(0, -1));
+      remainingSteps.length = 0;
+      remainingSteps.push(uniqueSteps[uniqueSteps.length - 1].desc);
+    }
+    return { completedSteps, remainingSteps, lastToolCall };
+  }
+
+  // Strategy 2: Use ordered tool phases as completed steps
+  if (toolPhaseOrder.length > 0) {
+    const completedSteps = [...toolPhaseOrder];
+    const remainingSteps = [];
+
+    // Infer remaining from what's missing
+    const hasSearch = toolPhaseSeen.has("搜索") || toolPhaseSeen.has("获取网页内容") || toolPhaseSeen.has("提取网页内容");
+    const hasRead = toolPhaseSeen.has("阅读文件") || toolPhaseSeen.has("阅读PDF");
+    const hasWrite = toolPhaseSeen.has("写入文件") || toolPhaseSeen.has("编辑文件");
+    const hasExec = toolPhaseSeen.has("执行命令");
+    const hasMedia = toolPhaseSeen.has("生成图片") || toolPhaseSeen.has("生成视频") || toolPhaseSeen.has("生成音乐") || toolPhaseSeen.has("生成语音");
+
+    if (hasSearch && !hasWrite && !hasMedia) remainingSteps.push("撰写产出");
+    if (hasRead && !hasWrite && !hasExec) remainingSteps.push("实现修改");
+    if (hasWrite && !hasExec) remainingSteps.push("测试验证");
+    if (hasMedia) remainingSteps.push("整合输出");
+
+    return { completedSteps, remainingSteps, lastToolCall };
+  }
+
+  return { completedSteps: [], remainingSteps: [], lastToolCall };
+}
+
 function generateRunSummary(filePath, tracked) {
   const events = parseJsonlEvents(filePath, 500);
   const extracted = extractActivity(events, "summary");
@@ -1007,7 +1247,7 @@ function updateIntermediateCheckpoint(key, entry, now = Date.now(), force = fals
   const existing = readCheckpoint(key);
   if (!force && existing?.updatedAt) {
     const lastUpdate = normalizeTimestamp(existing.updatedAt);
-    if (lastUpdate && now - lastUpdate < 60000) return false;
+    if (lastUpdate && now - lastUpdate < 10000) return false;
   }
 
   const agentId = resolveAgentIdFromSessionKey(key);
@@ -1026,6 +1266,26 @@ function updateIntermediateCheckpoint(key, entry, now = Date.now(), force = fals
     entry.totalCostUsd = summary.cost || entry.totalCostUsd || 0;
     entry.totalTokens = summary.tokens || entry.totalTokens || 0;
     entry.userStats = summary.userStats || entry.userStats || null;
+
+    // Infer task progress steps from JSONL transcript
+    // Always update — even if inferred steps are empty, the checkpoint still needs
+    // its writtenFiles/readFiles/etc. fields written out
+    const taskDesc = entry.task || entry.label || "";
+    const inferred = inferProgressFromJsonl(jsonlPath, taskDesc);
+    // If we already have steps from a previous refresh, only update if the new
+    // inference is consistent (same strategy) — avoid strategy-switching duplicates
+    const hasExistingSteps = (intermediateProgress.completedSteps?.length || 0) > 0;
+    if (inferred.completedSteps.length > 0) {
+      if (!hasExistingSteps || stepsAreConsistent(intermediateProgress.completedSteps, inferred.completedSteps)) {
+        intermediateProgress.completedSteps = inferred.completedSteps;
+      }
+    }
+    if (inferred.remainingSteps.length > 0) {
+      intermediateProgress.remainingSteps = inferred.remainingSteps;
+    }
+    if (inferred.lastToolCall) {
+      intermediateProgress.lastToolCall = inferred.lastToolCall;
+    }
   }
 
   const metadata = { ...(entry.metadata || {}) };
@@ -1110,17 +1370,47 @@ async function finalizeSubagentCheckpoint(key, entry, api, options = {}) {
   checkpoint.outcome = normalizeOutcome(entry.outcome);
   checkpoint.type = "final";
   checkpoint.updatedAt = new Date().toISOString();
+  const taskDesc = entry.task || entry.label || "";
   if (runSummary) {
+    // For final checkpoint, prefer existing intermediate checkpoint steps (already deduped)
+    // over re-running inference which may produce duplicates
+    const existingProgress = checkpoint.progress || readCheckpoint(key)?.progress;
+    const hasExistingSteps = (existingProgress?.completedSteps?.length || 0) > 0;
+
+    let finalCompletedSteps;
+    let finalRemainingSteps;
+    let lastToolCall = null;
+
+    if (hasExistingSteps) {
+      // Re-run inference only for lastToolCall and remaining steps update
+      const inferred = filePath ? inferProgressFromJsonl(filePath, taskDesc) : { completedSteps: [], remainingSteps: [], lastToolCall: null };
+      lastToolCall = inferred.lastToolCall;
+      const isSuccessful = normalizeOutcome(entry.outcome) === "completed";
+      finalCompletedSteps = isSuccessful
+        ? [...(existingProgress.completedSteps || []), ...(existingProgress.remainingSteps || [])]
+        : [...(existingProgress.completedSteps || [])];
+      finalRemainingSteps = isSuccessful ? [] : [...(existingProgress.remainingSteps || [])];
+    } else {
+      // No existing steps — fall back to fresh inference
+      const inferred = filePath ? inferProgressFromJsonl(filePath, taskDesc) : { completedSteps: [], remainingSteps: [], lastToolCall: null };
+      lastToolCall = inferred.lastToolCall;
+      const isSuccessful = normalizeOutcome(entry.outcome) === "completed";
+      finalCompletedSteps = isSuccessful
+        ? [...(inferred.completedSteps || []), ...(inferred.remainingSteps || [])]
+        : (inferred.completedSteps || []);
+      finalRemainingSteps = isSuccessful ? [] : (inferred.remainingSteps || []);
+    }
+
     checkpoint.progress = {
       writtenFiles: runSummary.writtenFiles || [],
       editedFiles: runSummary.editedFiles || [],
       readFiles: runSummary.readFiles || [],
       keyCommands: runSummary.keyCommands || [],
-      lastToolCall: null,
+      lastToolCall: lastToolCall,
       hasErrors: runSummary.hasErrors || false,
       lastError: entry.error || null,
-      completedSteps: [],
-      remainingSteps: []
+      completedSteps: finalCompletedSteps,
+      remainingSteps: finalRemainingSteps
     };
     entry.userStats = runSummary.userStats || entry.userStats || null;
   }
@@ -2334,6 +2624,127 @@ function createAlertCheckerService(config, logger) {
   };
 }
 
+async function discoverAbortedSubagentsAndNotifyMain(config, logger, api) {
+  logger?.info?.(`[claw-monitor] discoverAbortedSubagentsAndNotifyMain called, mainSessionKey=${mainSessionKey}, api=${api ? 'present' : 'null'}`);
+  const openclawDir = resolveOpenclawDir();
+  const agentsDir = path.join(openclawDir, "agents");
+  if (!fs.existsSync(agentsDir)) return;
+
+  const abortedSubagents = [];
+  try {
+    const agents = fs.readdirSync(agentsDir).filter(n => {
+      if (n === "main") return false;
+      return fs.existsSync(path.join(agentsDir, n, "sessions", "sessions.json"));
+    });
+
+    for (const agentId of agents) {
+      const mapping = loadSessionsJson(agentId);
+      if (!mapping) continue;
+      for (const [key, val] of Object.entries(mapping)) {
+        if (!key.includes(":subagent:")) continue;
+        if (val.abortedLastRun === true || val.status === "failed" || val.status === "timeout") {
+          const cp = readCheckpoint(key);
+          const taskDesc = cp?.task || cp?.label || val.label || "未知任务";
+          const agent = cp?.agentId || resolveAgentIdFromSessionKey(key) || agentId;
+          const completedSteps = cp?.progress?.completedSteps || [];
+          const remainingSteps = cp?.progress?.remainingSteps || [];
+          const writtenFiles = cp?.progress?.writtenFiles || [];
+          abortedSubagents.push({ key, agent, task: taskDesc, completedSteps, remainingSteps, writtenFiles });
+        }
+      }
+    }
+  } catch (err) {
+    logger?.warn?.(`[claw-monitor] discover aborted subagents failed: ${err instanceof Error ? err.message : String(err)}`);
+  }
+
+  // Resolve mainSessionKey if not yet set (startup time)
+  // Main sessions are long-lived channel sessions — their status is typically "done" or null, NOT "running".
+  // We match any non-subagent/cron/acp entry regardless of status.
+  if (!mainSessionKey) {
+    const mainSessionsPath = path.join(openclawDir, "agents", "main", "sessions", "sessions.json");
+    if (fs.existsSync(mainSessionsPath)) {
+      try {
+        const mainStore = JSON.parse(fs.readFileSync(mainSessionsPath, "utf-8"));
+        // Sort by lastInteractionAt descending so we pick the most recently active main session
+        const candidates = Object.entries(mainStore)
+          .filter(([key]) => !key.includes("subagent") && !key.includes("cron") && !key.includes("acp"))
+          .sort((a, b) => {
+            const bTime = normalizeTimestamp(b[1].lastInteractionAt) || normalizeTimestamp(b[1].updatedAt) || 0;
+            const aTime = normalizeTimestamp(a[1].lastInteractionAt) || normalizeTimestamp(a[1].updatedAt) || 0;
+            return bTime - aTime;
+          });
+        if (candidates.length > 0) {
+          mainSessionKey = candidates[0][0];
+          logger?.info?.(`[claw-monitor] startup: resolved mainSessionKey=${mainSessionKey} from sessions.json (status=${candidates[0][1].status})`);
+        } else {
+          logger?.warn?.(`[claw-monitor] startup: no main session candidates found in sessions.json`);
+        }
+      } catch (err) {
+        logger?.warn?.(`[claw-monitor] startup: failed to read main sessions.json: ${err instanceof Error ? err.message : String(err)}`);
+      }
+    } else {
+      logger?.warn?.(`[claw-monitor] startup: main sessions.json not found at ${mainSessionsPath}`);
+    }
+  }
+
+  if (abortedSubagents.length > 0) {
+    const parts = ["[Claw Monitor 网关重启通知] 网关刚刚重启了，以下子agent的任务被中断，请检查checkpoint并决定是否重新派发："];
+    for (const s of abortedSubagents) {
+      let info = `- ${s.agent}: "${s.task}" (${s.key})`;
+      if (s.completedSteps.length > 0) info += ` | 已完成: ${s.completedSteps.join(", ")}`;
+      if (s.remainingSteps.length > 0) info += ` | 剩余: ${s.remainingSteps.join(", ")}`;
+      if (s.writtenFiles.length > 0) info += ` | 已产出文件: ${s.writtenFiles.join(", ")}`;
+      parts.push(info);
+    }
+    parts.push("请用 subagent_checkpoint action=read 读取具体checkpoint，然后决定是否重新spawn。");
+    const notifyText = parts.join("\n");
+
+    if (mainSessionKey && api) {
+      // 1. Write to JSONL directly (ensures message is in transcript)
+      const jsonlOk = injectViaJsonl(mainSessionKey, notifyText);
+      logger?.info?.(`[claw-monitor] restart notify: injectViaJsonl=${jsonlOk} for mainSessionKey=${mainSessionKey}`);
+      // 2. Also try enqueueNextTurnInjection as backup
+      try {
+        await api.enqueueNextTurnInjection({
+          sessionKey: mainSessionKey,
+          text: notifyText,
+          placement: "prepend_context",
+          idempotencyKey: `restart-notify-${Date.now()}`,
+        });
+        logger?.info?.(`[claw-monitor] restart notify: enqueueNextTurnInjection succeeded`);
+      } catch (err) {
+        logger?.warn?.(`[claw-monitor] restart notify: enqueueNextTurnInjection failed: ${err instanceof Error ? err.message : String(err)}`);
+      }
+      // 3. Trigger heartbeat to wake up main session
+      try {
+        if (apiRef?.runtime?.system?.requestHeartbeat) {
+          apiRef.runtime.system.requestHeartbeat({ source: "claw-monitor", intent: "restart-recovery", reason: `${abortedSubagents.length} aborted subagent(s) found on startup`, sessionKey: mainSessionKey });
+          logger?.info?.(`[claw-monitor] restart notify: requested heartbeat to wake main session`);
+        } else {
+          logger?.warn?.(`[claw-monitor] restart notify: requestHeartbeat not available`);
+        }
+      } catch (err) {
+        logger?.warn?.(`[claw-monitor] restart notify: heartbeat failed: ${err instanceof Error ? err.message : String(err)}`);
+      }
+      // 4. Also enqueue system event as another wake-up path
+      try {
+        if (apiRef?.runtime?.system?.enqueueSystemEvent) {
+          apiRef.runtime.system.enqueueSystemEvent(notifyText, { sessionKey: mainSessionKey });
+          logger?.info?.(`[claw-monitor] restart notify: enqueued system event for mainSessionKey=${mainSessionKey}`);
+        }
+      } catch (err) {
+        logger?.warn?.(`[claw-monitor] restart notify: enqueueSystemEvent failed: ${err instanceof Error ? err.message : String(err)}`);
+      }
+    } else {
+      // mainSessionKey not yet available — defer injection until before_prompt_build captures it
+      pendingRestartNotification = notifyText;
+      logger?.info?.(`[claw-monitor] restart notify: mainSessionKey not yet available, deferred to before_prompt_build (aborted=${abortedSubagents.length})`);
+    }
+  }
+
+  return abortedSubagents.length;
+}
+
 function createCheckpointRefreshService(config, logger) {
   let intervalHandle = null;
 
@@ -2346,6 +2757,14 @@ function createCheckpointRefreshService(config, logger) {
         logger.warn(`[claw-monitor] Initial finalize ended sessions error: ${err instanceof Error ? err.message : String(err)}`);
       });
       pruneStaleTrackedSubagents(config, logger);
+      // Gateway restart notification: check for aborted subagents and notify main session
+      discoverAbortedSubagentsAndNotifyMain(config, logger, apiRef).then(abortedCount => {
+        if (abortedCount > 0) {
+          logger.info(`[claw-monitor] Found ${abortedCount} aborted subagent(s) on startup, notified main session`);
+        }
+      }).catch(err => {
+        logger.warn(`[claw-monitor] startup abort notification error: ${err instanceof Error ? err.message : String(err)}`);
+      });
       intervalHandle = setInterval(async () => {
         try {
           const now = Date.now();
@@ -2561,6 +2980,15 @@ module.exports = definePluginEntry({
         metadata: entry.metadata || {}
       });
 
+      // Schedule first intermediate checkpoint update 5 seconds after spawn
+      // so the subagent's initial tool calls get captured early
+      setTimeout(() => {
+        const tracked = subagentTracker.get(childKey);
+        if (tracked && !tracked.endedAt) {
+          updateIntermediateCheckpoint(childKey, tracked, Date.now(), true);
+        }
+      }, 5000).unref?.();
+
       // --- Check for checkpoint to restore ---
       let checkpointToRestore = null;
 
@@ -2766,6 +3194,23 @@ module.exports = definePluginEntry({
               break;
             }
           }
+        }
+      }
+
+      // Flush deferred restart notification if mainSessionKey was captured just now
+      if (pendingRestartNotification && mainSessionKey) {
+        const notifyText = pendingRestartNotification;
+        pendingRestartNotification = null;
+        api.logger.info(`[claw-monitor] before_prompt_build: flushing deferred restart notification to mainSessionKey=${mainSessionKey}`);
+        try {
+          const jsonlOk = injectViaJsonl(mainSessionKey, notifyText);
+          api.logger.info(`[claw-monitor] deferred restart notify: injectViaJsonl=${jsonlOk}`);
+          await injectIntoSession(api, mainSessionKey, notifyText, `restart-notify-deferred-${Date.now()}`);
+          if (apiRef?.runtime?.system?.requestHeartbeat) {
+            apiRef.runtime.system.requestHeartbeat({ source: "claw-monitor", intent: "restart-recovery", reason: "deferred restart notification", sessionKey: mainSessionKey });
+          }
+        } catch (err) {
+          api.logger.warn(`[claw-monitor] deferred restart notify failed: ${err instanceof Error ? err.message : String(err)}`);
         }
       }
     });
