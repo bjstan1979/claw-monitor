@@ -1525,7 +1525,7 @@ function discoverRunningSubagentsFromSessionsJson(config, logger) {
       if (!mapping) continue;
       for (const [key, val] of Object.entries(mapping)) {
         if (!key.startsWith("agent:") || subagentTracker.has(key)) continue;
-        if (!key.includes(":subagent:")) continue;
+        if (!key.includes(":subagent:") && !key.includes(":dashboard:") && !key.includes(":cron:")) continue;
         if (isTerminalSessionStatus(val.status, val.endedAt)) continue;
         const lastSeen =
           normalizeTimestamp(val.lastInteractionAt) ||
@@ -1568,7 +1568,7 @@ async function finalizeEndedSessionsFromSessionsJson(config, logger, api) {
       const mapping = loadSessionsJson(agentId);
       if (!mapping) continue;
       for (const [key, val] of Object.entries(mapping)) {
-        if (!key.startsWith("agent:") || !key.includes(":subagent:")) continue;
+        if (!key.startsWith("agent:") || (!key.includes(":subagent:") && !key.includes(":dashboard:") && !key.includes(":cron:"))) continue;
         if (!isTerminalSessionStatus(val.status, val.endedAt)) continue;
         const cp = readCheckpoint(key);
         if (cp?.type === "final") continue;
@@ -2702,7 +2702,7 @@ async function discoverAbortedSubagentsAndNotifyMain(config, logger, api) {
       const mapping = loadSessionsJson(agentId);
       if (!mapping) continue;
       for (const [key, val] of Object.entries(mapping)) {
-        if (!key.includes(":subagent:")) continue;
+        if (!key.includes(":subagent:") && !key.includes(":dashboard:") && !key.includes(":cron:")) continue;
         if (val.abortedLastRun === true || val.status === "failed" || val.status === "timeout") {
           const cp = readCheckpoint(key);
           const taskDesc = cp?.task || cp?.label || val.label || "未知任务";
