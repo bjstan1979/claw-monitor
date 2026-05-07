@@ -917,13 +917,13 @@ function createHarnessStatusTool() {
   return {
     name: "harness_status",
     description: "Show current harness rule evaluation status, active rules, and session metrics.",
-    inputSchema: {
+    parameters: {
       type: "object",
       properties: {
         sessionKey: { type: "string", description: "Session key to check (optional, defaults to current)" },
       },
     },
-    async execute(params) {
+    async execute(_id, params) {
       const config = loadHarnessConfig();
       if (!config) {
         return { content: [{ type: "text", text: "Harness config not loaded (harness-rules.json missing or invalid)." }] };
@@ -957,14 +957,14 @@ function createHarnessLogTool() {
   return {
     name: "harness_log",
     description: "Show recent harness evaluation log entries.",
-    inputSchema: {
+    parameters: {
       type: "object",
       properties: {
         limit: { type: "number", description: "Max entries to show (default 20)", minimum: 1, maximum: 100 },
         ruleId: { type: "string", description: "Filter by rule ID" },
       },
     },
-    async execute(params) {
+    async execute(_id, params) {
       const limit = params?.limit || 20;
       let entries = [...harnessLog].reverse();
       if (params?.ruleId) {
