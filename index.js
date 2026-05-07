@@ -678,11 +678,43 @@ function loadHarnessConfig() {
   }
 }
 
+// --- Harness context window lookup from openclaw.json ---
+const contextWindowCache = new Map(); // modelId -> contextWindow
+let contextWindowCacheMtime = 0;
+
+function getContextWindowForModel(modelId) {
+  if (!modelId) return 170000; // default fallback
+  try {
+    const configPath = path.join(resolveOpenclawDir(), "openclaw.json");
+    const stat = fs.statSync(configPath);
+    if (contextWindowCache.size > 0 && stat.mtimeMs === contextWindowCacheMtime) {
+      return contextWindowCache.get(modelId) || 170000;
+    }
+    const content = fs.readFileSync(configPath, "utf-8");
+    const config = JSON.parse(content);
+    contextWindowCache.clear();
+    const providers = config.models?.providers || {};
+    for (const [provName, prov] of Object.entries(providers)) {
+      for (const model of (prov.models || [])) {
+        const fullId = provName + "/" + model.id;
+        if (model.contextWindow) {
+          contextWindowCache.set(fullId, model.contextWindow);
+          contextWindowCache.set(model.id, model.contextWindow);
+        }
+      }
+    }
+    contextWindowCacheMtime = stat.mtimeMs;
+    return contextWindowCache.get(modelId) || 170000;
+  } catch {
+    return 170000;
+  }
+}
+
 // --- Harness context usage estimator ---
 function estimateContextUsage(sessionKey) {
   const meta = getSessionMetaFromSessionsJson(sessionKey);
   if (meta?.totalTokens) {
-    const contextWindow = 170000;
+    const contextWindow = getContextWindowForModel(meta.model);
     return Math.min(99, Math.round((meta.totalTokens / contextWindow) * 100));
   }
   const agentId = resolveAgentIdFromSessionKey(sessionKey);
@@ -692,7 +724,7 @@ function estimateContextUsage(sessionKey) {
     try {
       const stat = fs.statSync(jsonlPath);
       const estimatedTokens = Math.round((stat.size / 1024) * 300);
-      const contextWindow = 170000;
+      const contextWindow = getContextWindowForModel(meta?.model);
       return Math.min(99, Math.round((estimatedTokens / contextWindow) * 100));
     } catch {}
   }
