@@ -16,6 +16,39 @@ Harness 是 claw-monitor 插件新增的实时监控层，通过 OpenClaw 插件
    - `requireApproval` → 请求人工确认（Control UI 有确认按钮；CLI/聊天渠道走超时机制）
    - `pass` → 不拦截，但可以在 prompt 中注入提醒文本
 
+## 铁律强制注入
+
+每轮 prompt 构建时，`before_prompt_build` hook 会自动注入铁律摘要。铁律内容来自 `iron-laws.json` 配置文件，不是硬编码的——改文件就能调整，无需改代码。
+
+### 通用铁律（7条，所有 agent 共有）
+
+1. 先查记忆再动手 — MEMORY.md + memory_recall + lcm_grep，不要从零摸索
+2. 做完必交付 — 所有步骤完成后主动announce结果并结束，不要干等后续指令
+3. 安全红线不碰 — 社交写操作、金融操作，一律上报等批准
+4. 先说判断再行动 — 发现更优路径时，先告诉调度员你的判断
+5. 修完必记录 — 解决了什么问题、怎么解决的，写进MEMORY.md
+6. 失败必重试 — 遇到错误先分析原因，能修就修/能重试就重试，最多重试2次，超过2次上报
+7. 不理解就不动手 — 不理解根因就去搜网络、查文档、读源码、做小实验验证假设（coder除外）
+
+### 角色专属铁律（替换第2条）
+
+| Agent | 专属铁律 |
+|-------|---------|
+| coder | 能修就修，不卡住 — 小问题自己解决，大问题上报 |
+| media | 每步验证效果 + 交付前自检 — 做完一步就检查，ffprobe+截帧+播放确认 |
+| researcher | 任务太大就拆 — 单任务输出只开头就结束→拆成子课题并行 |
+| news | 忠实原文 — 严禁改写/加工/意译新闻内容，snippet直接引用 |
+| doctor | 医疗免责 — 不做诊断、不开药方、不替代专业医疗 |
+
+注入格式：
+```
+[HARNESS 铁律] 以下规则优先级最高，每轮必须遵守:
+1. 先查记忆再动手 — ...
+2. 能修就修，不卡住 — ...（coder专属，替换"做完必交付"）
+3. 安全红线不碰 — ...
+...
+```
+
 ## 当前生效的规则
 
 | 规则 ID | 触发条件 | 适用角色 | 动作 | 超时行为 |
@@ -24,20 +57,31 @@ Harness 是 claw-monitor 插件新增的实时监控层，通过 OpenClaw 插件
 | context-overflow-block | 上下文 > 90% | main, coder | block | 直接拒绝 |
 | tool-burst-protection | 10分钟内 > 50次工具调用 | main | requireApproval | 15秒超时后放行 |
 | long-session-check | 会话运行 > 60分钟 | main, coder, researcher | pass | 在 prompt 中注入提醒 |
+| error-retry-limit | 错误次数 > 3 | main, coder, researcher | requireApproval | 30秒超时后拒绝 |
 
 ## 各 hook 的作用
 
 - **before_tool_call** — 每次工具调用前评估规则，可以 block 或 requireApproval
 - **message_sending** — 将紧急通知注入到发送给用户的消息中（前缀 `[HARNESS]`）
-- **before_prompt_build** — 在构建 prompt 时注入规则提醒（如长时间会话建议保存进度）
+- **before_prompt_build** — 每轮强制注入铁律摘要 + 规则触发的上下文提醒
 - **after_tool_call** — 工具调用出错时记录 errorCount，供规则评估使用
 
 ## 通知前缀
 
 - `[CLAW-MONITOR]` — 原有的监控通知（告警、检查点、子代理状态）
 - `[HARNESS]` — Harness 产生的通知（规则评估结果、上下文注入）
+- `[HARNESS 铁律]` — 铁律强制注入
 
-两个系统共存，互不干扰。
+三个系统共存，互不干扰。
+
+## 配置文件
+
+| 文件 | 位置 | 作用 | 热加载 |
+|------|------|------|--------|
+| `harness-rules.json` | 与 index.js 同目录 | 规则配置（阈值、动作、角色） | 是（mtime 缓存） |
+| `iron-laws.json` | 与 index.js 同目录 | 铁律内容（通用 + 角色专属） | 是（mtime 缓存） |
+
+修改配置文件后无需重启 Gateway，下次 hook 触发时自动加载新内容。
 
 ## 如何使用
 
@@ -51,7 +95,7 @@ Harness 是 claw-monitor 插件新增的实时监控层，通过 OpenClaw 插件
 
 ### 自定义规则
 
-编辑 `harness-rules.json`（与 index.js 同目录），修改阈值或添加新规则。文件修改后自动重新加载（无需重启 Gateway）。
+编辑 `harness-rules.json`，修改阈值或添加新规则。
 
 规则结构：
 ```json
@@ -72,6 +116,22 @@ Harness 是 claw-monitor 插件新增的实时监控层，通过 OpenClaw 插件
 比较运算符：`gt`（大于）、`lt`（小于）、`gte`（大于等于）、`lte`（小于等于）、`eq`（等于）
 
 多个条件之间是 AND 逻辑（全部满足才触发）。
+
+### 自定义铁律
+
+编辑 `iron-laws.json`，修改通用铁律或添加新的角色专属铁律。
+
+```json
+{
+  "ironLaws": {
+    "universal": ["铁律1", "铁律2", ...],
+    "roles": {
+      "coder": "角色专属铁律",
+      "newrole": "新角色的专属铁律"
+    }
+  }
+}
+```
 
 ### 关闭 Harness
 
@@ -101,10 +161,10 @@ Harness 是 claw-monitor 插件新增的实时监控层，通过 OpenClaw 插件
 
 ## 数据来源
 
-- 上下文使用率：从 sessions.json 的 totalTokens 估算，或从 JSONL 文件大小估算
+- 上下文使用率：从 `sessions.json` 的 `totalTokens` + `openclaw.json` 模型配置的 `contextWindow` 计算（不再硬编码 170K）
 - 工具调用计数：Harness 自行维护的滑动时间窗口计数器
 - 会话时长：从首次工具调用时间开始计算
-- 错误计数：从 after_tool_call hook 中记录
+- 错误计数：从 `after_tool_call` hook 中记录
 
 ## 文件清单
 
@@ -112,5 +172,6 @@ Harness 是 claw-monitor 插件新增的实时监控层，通过 OpenClaw 插件
 |------|------|
 | `index.js` | Harness 函数和 hook 注册（与原有监控代码同文件） |
 | `harness-rules.json` | 规则配置文件 |
+| `iron-laws.json` | 铁律配置文件 |
 | `openclaw.plugin.json` | 插件配置 schema（含 harness 相关属性） |
 | `test-harness.js` | 集成测试脚本 |
