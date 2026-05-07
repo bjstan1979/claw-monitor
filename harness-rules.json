@@ -1,6 +1,7 @@
 {
   "version": 1,
   "defaultAction": "pass",
+  "agentApproval": true,
   "rules": [
     {
       "id": "context-overflow-warning",

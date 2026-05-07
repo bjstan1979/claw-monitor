@@ -23,6 +23,10 @@ const harnessSessionMetrics = new Map(); // sessionKey -> { toolCallTimestamps: 
 const contextWarningCooldown = new Map(); // sessionKey -> lastWarningTimestamp (5-min cooldown for context-overflow-warning)
 const harnessPendingNotifications = []; // { sessionKey, text, ts, urgency: "high"|"normal" }
 const harnessLog = [];           // { ts, ruleId, agentId, sessionKey, action, result }
+const harnessAllowedRules = new Map(); // sessionKey -> Set of ruleIds that have been explicitly allowed by main agent
+let cachedMainSessionKey = null; // cached result of findMainSessionKey()
+let cachedMainSessionKeyTs = 0;  // timestamp of last cache refresh
+const HARNESS_ALLOW_DIR = "/tmp/harness-allow"; // file-based allow markers
 
 // --- Helpers ---
 function resolveOpenclawDir() {
@@ -668,6 +672,76 @@ function isCommandSafe(cmd) {
   return true;
 }
 
+// --- Find main agent session key (with 60s cache) ---
+async function findMainSessionKey(api) {
+  // Return cached if fresh (< 60s)
+  if (cachedMainSessionKey && Date.now() - cachedMainSessionKeyTs < 60000) {
+    return cachedMainSessionKey;
+  }
+  // Also trust the tracked mainSessionKey if available
+  if (mainSessionKey) {
+    cachedMainSessionKey = mainSessionKey;
+    cachedMainSessionKeyTs = Date.now();
+    return mainSessionKey;
+  }
+  try {
+    const sessions = await api.callGatewayMethod("session.list", {});
+    if (Array.isArray(sessions)) {
+      const main = sessions.find(s => s.agentId === "main" && s.status === "active");
+      if (main) {
+        cachedMainSessionKey = main.sessionKey || main.key || null;
+        cachedMainSessionKeyTs = Date.now();
+        return cachedMainSessionKey;
+      }
+    }
+  } catch (err) {
+    api.logger?.warn?.(`[HARNESS] findMainSessionKey failed: ${err instanceof Error ? err.message : String(err)}`);
+  }
+  return null;
+}
+
+// --- Check if a harness rule has been explicitly allowed for a session ---
+function checkHarnessAllowMarker(sessionKey, ruleId) {
+  // Check in-memory map first
+  const allowedSet = harnessAllowedRules.get(sessionKey);
+  if (allowedSet && allowedSet.has(ruleId)) {
+    return true;
+  }
+  // Check file-based marker
+  try {
+    const fs = require("fs");
+    const markerFile = `${HARNESS_ALLOW_DIR}/${sessionKey.replace(/[:@]/g, "_")}__${ruleId}`;
+    if (fs.existsSync(markerFile)) {
+      // Add to in-memory map and remove file marker
+      if (!harnessAllowedRules.has(sessionKey)) {
+        harnessAllowedRules.set(sessionKey, new Set());
+      }
+      harnessAllowedRules.get(sessionKey).add(ruleId);
+      try { fs.unlinkSync(markerFile); } catch (_) { /* ignore */ }
+      return true;
+    }
+  } catch (_) { /* ignore fs errors */ }
+  return false;
+}
+
+// --- Create a harness allow marker (for external tools to call) ---
+function createHarnessAllowMarker(sessionKey, ruleId) {
+  // Add to in-memory map
+  if (!harnessAllowedRules.has(sessionKey)) {
+    harnessAllowedRules.set(sessionKey, new Set());
+  }
+  harnessAllowedRules.get(sessionKey).add(ruleId);
+  // Also create file-based marker as backup
+  try {
+    const fs = require("fs");
+    if (!fs.existsSync(HARNESS_ALLOW_DIR)) {
+      fs.mkdirSync(HARNESS_ALLOW_DIR, { recursive: true });
+    }
+    const markerFile = `${HARNESS_ALLOW_DIR}/${sessionKey.replace(/[:@]/g, "_")}__${ruleId}`;
+    fs.writeFileSync(markerFile, new Date().toISOString());
+  } catch (_) { /* ignore fs errors */ }
+}
+
 // --- Harness config loader ---
 function loadHarnessConfig() {
   const configPath = path.join(__dirname, "harness-rules.json");
@@ -980,6 +1054,7 @@ function createHarnessStatusTool() {
       const parts = [];
       parts.push(`Harness version: ${config.version || 1}`);
       parts.push(`Default action: ${config.defaultAction || "pass"}`);
+      parts.push(`Agent approval: ${config.agentApproval !== false ? "enabled" : "disabled"}`);
       parts.push(`Rules: ${config.rules?.length || 0}`);
       for (const rule of (config.rules || [])) {
         const status = rule.enabled === false ? "DISABLED" : "enabled";
@@ -3874,7 +3949,7 @@ module.exports = definePluginEntry({
       }
     });
 
-    // Hook: before_prompt_build — capture main session key and flush alerts
+    // Hook: before_prompt_build — capture main session key, check HARNESS_ALLOW, flush alerts
     api.on("before_prompt_build", async (event, ctx) => {
       // Capture main agent's session key for push alerts
       if (ctx?.sessionKey) {
@@ -3884,6 +3959,24 @@ module.exports = definePluginEntry({
         } else if (ctx.sessionKey !== mainSessionKey && !ctx.sessionKey.includes("subagent")) {
           mainSessionKey = ctx.sessionKey;
           api.logger.info(`[claw-monitor] before_prompt_build: updated mainSessionKey=${mainSessionKey}`);
+        }
+      }
+
+      // --- Check for HARNESS_ALLOW messages in subagent sessions ---
+      if (ctx?.sessionKey && event?.messages) {
+        try {
+          const lastUserMsg = [...event.messages].reverse().find(m => m.role === "user");
+          if (lastUserMsg) {
+            const content = typeof lastUserMsg.content === "string" ? lastUserMsg.content : JSON.stringify(lastUserMsg.content);
+            const allowMatch = content.match(/HARNESS_ALLOW\s+(\S+)/);
+            if (allowMatch) {
+              const ruleId = allowMatch[1];
+              createHarnessAllowMarker(ctx.sessionKey, ruleId);
+              api.logger.info(`[HARNESS] HARNESS_ALLOW detected: session=${ctx.sessionKey} rule=${ruleId}`);
+            }
+          }
+        } catch (allowErr) {
+          api.logger.warn(`[HARNESS] HARNESS_ALLOW check failed: ${allowErr instanceof Error ? allowErr.message : String(allowErr)}`);
         }
       }
 
@@ -4054,6 +4147,62 @@ module.exports = definePluginEntry({
 
           const title = interpolateTemplate(actionConfig.title || "Harness Approval Required", metrics);
           const description = interpolateTemplate(actionConfig.description || `Rule ${rule.id} requires approval for tool ${event.toolName}.`, metrics);
+          const timeoutBehavior = actionConfig.timeoutBehavior || "allow";
+
+          // --- Agent Approval Mode ---
+          // When agentApproval is enabled (default), instead of relying on
+          // the UI approval flow (which doesn't work on WeChat/CLI),
+          // we inject a notification into the main agent's session and
+          // decide pass/block based on timeoutBehavior.
+          const agentApprovalEnabled = harnessConfig?.agentApproval !== false;
+
+          if (agentApprovalEnabled) {
+            // Check if this rule has been explicitly allowed for this session
+            if (checkHarnessAllowMarker(sessionKey, rule.id)) {
+              logHarnessEvent(rule.id, agentRole, sessionKey, "requireApproval", "agent-approved-previously");
+              api.logger.info(`[HARNESS] agent-approval: rule ${rule.id} previously allowed for session=${sessionKey}, passing`);
+              return; // pass through
+            }
+
+            // Inject notification into main agent session
+            const mainKey = await findMainSessionKey(api);
+            if (mainKey) {
+              const notifyText = [
+                `[HARNESS] 规则触发: ${rule.name} (${rule.id})`,
+                `描述: ${description}`,
+                `子Agent: ${sessionKey}`,
+                `工具: ${event.toolName}`,
+                `超时行为: ${timeoutBehavior === "allow" ? "放行" : "拒绝"}`,
+                timeoutBehavior === "deny"
+                  ? `→ 如需放行: sessions_send(sessionKey="${sessionKey}", message="HARNESS_ALLOW ${rule.id}") 或 subagent_steer(sessionKey="${sessionKey}", message="HARNESS_ALLOW ${rule.id}") 或创建标记文件: mkdir -p ${HARNESS_ALLOW_DIR} && touch ${HARNESS_ALLOW_DIR}/${sessionKey.replace(/[:@]/g, "_")}__${rule.id}`
+                  : `→ 如需干预: subagent_steer(sessionKey="${sessionKey}", message="...") 或 subagent_kill(sessionKey="${sessionKey}")`,
+              ].join("\n");
+
+              try {
+                await injectIntoSession(api, mainKey, notifyText, `harness-approval-${rule.id}-${sessionKey}-${Date.now()}`);
+                api.logger.info(`[HARNESS] agent-approval: injected notification to mainSessionKey=${mainKey} for rule=${rule.id}`);
+              } catch (injectErr) {
+                api.logger.warn(`[HARNESS] agent-approval: failed to inject notification: ${injectErr instanceof Error ? injectErr.message : String(injectErr)}`);
+              }
+            } else {
+              api.logger.warn(`[HARNESS] agent-approval: could not find main session key for notification`);
+            }
+
+            // Decide pass or block based on timeoutBehavior
+            if (timeoutBehavior === "allow") {
+              logHarnessEvent(rule.id, agentRole, sessionKey, "requireApproval", "agent-mode-passed");
+              api.logger.info(`[HARNESS] agent-approval: rule ${rule.id} passed (timeoutBehavior=allow) for session=${sessionKey}`);
+              return; // pass through
+            } else {
+              // timeoutBehavior === "deny" → block
+              const blockReason = `[harness-rule: ${rule.id}] ${description}`;
+              logHarnessEvent(rule.id, agentRole, sessionKey, "requireApproval", "agent-mode-blocked");
+              api.logger.info(`[HARNESS] agent-approval: rule ${rule.id} blocked (timeoutBehavior=deny) for session=${sessionKey}`);
+              return { block: true, blockReason };
+            }
+          }
+
+          // --- Fallback: original UI approval flow (when agentApproval is disabled) ---
           logHarnessEvent(rule.id, agentRole, sessionKey, "requireApproval", "pending");
           api.logger.info(`[HARNESS] requireApproval tool=${event.toolName} rule=${rule.id} agent=${agentRole}`);
           return {

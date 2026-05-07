@@ -150,6 +150,41 @@ Harness 是 claw-monitor 插件新增的实时监控层，通过 OpenClaw 插件
 
 ## requireApproval 在不同渠道的表现
 
+### Agent 控制模式（默认启用）
+
+当 `agentApproval: true`（默认）时，`requireApproval` 规则不再依赖 UI 审核流程，而是由主 agent（葱花）控制：
+
+1. **触发时**：向主 agent 的 session 注入通知消息，包含规则名、描述、子 agent sessionKey、工具名和建议操作
+2. **根据 `timeoutBehavior` 决定行为**：
+   - `timeoutBehavior: "allow"` → **放行**（工具调用正常执行），主 agent 可事后 steer/kill 干预
+   - `timeoutBehavior: "deny"` → **阻止**（工具调用被拒绝），主 agent 可通过发送 `HARNESS_ALLOW <ruleId>` 放行
+3. **放行机制**：主 agent 向子 agent 发送 `HARNESS_ALLOW <ruleId>` 后，该规则对该 session 永久放行（内存 + 文件标记）
+
+#### 放行操作
+
+对于 `timeoutBehavior: "deny"` 的规则（如 error-retry-limit），主 agent 可以：
+
+- **方式1**：`sessions_send(sessionKey="<子agent>", message="HARNESS_ALLOW error-retry-limit")`
+- **方式2**：`subagent_steer(sessionKey="<子agent>", message="HARNESS_ALLOW error-retry-limit")`
+- **方式3**：创建标记文件 `touch /tmp/harness-allow/<sessionKey>__<ruleId>`
+
+#### 通知示例
+
+```
+[HARNESS] 规则触发: Error Retry Limit (error-retry-limit)
+描述: 3 tool errors recorded. Possible retry loop — continue?
+子Agent: agent:coder:subagent:xxx
+工具: exec
+超时行为: 拒绝
+→ 如需放行: sessions_send(sessionKey="agent:coder:subagent:xxx", message="HARNESS_ALLOW error-retry-limit") 或 subagent_steer(sessionKey="agent:coder:subagent:xxx", message="HARNESS_ALLOW error-retry-limit") 或创建标记文件: mkdir -p /tmp/harness-allow && touch /tmp/harness-allow/agent_coder_subagent_xxx__error-retry-limit
+```
+
+#### 关闭 Agent 控制模式
+
+在 `harness-rules.json` 中设置 `"agentApproval": false`，将回退到原始 UI 审核流程。
+
+### 原始 UI 审核流程（agentApproval: false 时）
+
 | 渠道 | 表现 |
 |------|------|
 | Control UI（Web 界面） | 显示确认按钮，用户可点击 allow/deny |
@@ -157,7 +192,7 @@ Harness 是 claw-monitor 插件新增的实时监控层，通过 OpenClaw 插件
 | 超时后 `timeoutBehavior: "allow"` | 自动放行（等于"记录但不阻止"） |
 | 超时后 `timeoutBehavior: "deny"` | 自动拒绝 |
 
-**结论：** 在非 Web 界面下，`requireApproval` 等于"记录事件 + 超时后按配置放行或拒绝"。真正有即时效果的是 `block`（直接拒绝）和 `pass`（注入提醒）。
+**结论：** Agent 控制模式下，`requireApproval` 在微信/CLI渠道不再等同于 block，而是由主 agent 实时决策。
 
 ## 数据来源
 
