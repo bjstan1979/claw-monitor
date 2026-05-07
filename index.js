@@ -20,6 +20,7 @@ let harnessConfigMtime = 0;      // mtime of harness-rules.json for cache invali
 let ironLawsConfig = null;       // parsed iron-laws.json
 let ironLawsConfigMtime = 0;     // mtime of iron-laws.json for cache invalidation
 const harnessSessionMetrics = new Map(); // sessionKey -> { toolCallTimestamps: [], turnCount: 0, startedAt: number, errorCount: 0 }
+const contextWarningCooldown = new Map(); // sessionKey -> lastWarningTimestamp (5-min cooldown for context-overflow-warning)
 const harnessPendingNotifications = []; // { sessionKey, text, ts, urgency: "high"|"normal" }
 const harnessLog = [];           // { ts, ruleId, agentId, sessionKey, action, result }
 
@@ -92,6 +93,10 @@ function getSessionMetaFromSessionsJson(sessionKey) {
     startedAt: entry.startedAt,
     label: entry.label,
     totalTokens: entry.totalTokens,
+    totalTokensFresh: entry.totalTokensFresh,
+    contextTokens: entry.contextTokens,
+    model: entry.model,
+    modelProvider: entry.modelProvider,
     estimatedCostUsd: entry.estimatedCostUsd,
     runtimeMs: entry.runtimeMs,
     spawnedBy: entry.spawnedBy,
@@ -756,24 +761,67 @@ function getContextWindowForModel(modelId) {
 }
 
 // --- Harness context usage estimator ---
+// Reads the last assistant message's usage.totalTokens from JSONL for accurate context usage.
+// Falls back to sessions.json totalTokens, then file-size heuristic (with corrected ratio).
 function estimateContextUsage(sessionKey) {
   const meta = getSessionMetaFromSessionsJson(sessionKey);
-  if (meta?.totalTokens) {
-    const contextWindow = getContextWindowForModel(meta.model);
-    return Math.min(99, Math.round((meta.totalTokens / contextWindow) * 100));
-  }
+  const contextWindow = meta?.contextTokens || getContextWindowForModel(meta?.model);
+
+  // Strategy 1: Read the latest assistant message usage from JSONL (most accurate)
   const agentId = resolveAgentIdFromSessionKey(sessionKey);
   const sessionId = resolveSessionIdFromSessionKey(sessionKey);
   const jsonlPath = findJsonlFile(agentId, sessionId);
   if (jsonlPath) {
     try {
+      const lastUsage = readLastAssistantUsage(jsonlPath);
+      if (lastUsage !== null) {
+        return Math.min(99, Math.round((lastUsage / contextWindow) * 100));
+      }
+    } catch {}
+  }
+
+  // Strategy 2: Use sessions.json totalTokens (may be stale but still reasonable)
+  if (meta?.totalTokens) {
+    return Math.min(99, Math.round((meta.totalTokens / contextWindow) * 100));
+  }
+
+  // Strategy 3: File-size heuristic (corrected ratio: ~40 tokens/KB, not 300)
+  if (jsonlPath) {
+    try {
       const stat = fs.statSync(jsonlPath);
-      const estimatedTokens = Math.round((stat.size / 1024) * 300);
-      const contextWindow = getContextWindowForModel(meta?.model);
+      const estimatedTokens = Math.round((stat.size / 1024) * 40);
       return Math.min(99, Math.round((estimatedTokens / contextWindow) * 100));
     } catch {}
   }
   return 0;
+}
+
+// Read the usage.totalTokens from the last assistant message in a JSONL file.
+// Scans from the end of the file for efficiency (reads last 64KB only).
+function readLastAssistantUsage(jsonlPath) {
+  try {
+    const stat = fs.statSync(jsonlPath);
+    const readSize = Math.min(stat.size, 65536); // Read last 64KB
+    const buf = Buffer.alloc(readSize);
+    const fd = fs.openSync(jsonlPath, 'r');
+    fs.readSync(fd, buf, 0, readSize, stat.size - readSize);
+    fs.closeSync(fd);
+    const content = buf.toString('utf-8');
+    const lines = content.split('\n');
+    // Scan from the end to find the last assistant message with usage
+    for (let i = lines.length - 1; i >= 0; i--) {
+      const line = lines[i].trim();
+      if (!line) continue;
+      try {
+        const obj = JSON.parse(line);
+        const msg = obj.message || obj;
+        if (msg.role === 'assistant' && msg.usage && typeof msg.usage.totalTokens === 'number') {
+          return msg.usage.totalTokens;
+        }
+      } catch {}
+    }
+  } catch {}
+  return null;
 }
 
 // --- Harness session metrics tracker ---
@@ -3993,6 +4041,17 @@ module.exports = definePluginEntry({
         }
 
         if (rule.action === "requireApproval") {
+          // Cooldown check for context-overflow-warning: 5-minute cooldown per session
+          if (rule.id === "context-overflow-warning") {
+            const now = Date.now();
+            const lastWarning = contextWarningCooldown.get(sessionKey) || 0;
+            if (now - lastWarning < 300000) { // 5 minutes
+              api.logger.info(`[HARNESS] context-overflow-warning cooldown active for session=${sessionKey}, skipping (last warning ${Math.round((now - lastWarning) / 1000)}s ago)`);
+              return;
+            }
+            contextWarningCooldown.set(sessionKey, now);
+          }
+
           const title = interpolateTemplate(actionConfig.title || "Harness Approval Required", metrics);
           const description = interpolateTemplate(actionConfig.description || `Rule ${rule.id} requires approval for tool ${event.toolName}.`, metrics);
           logHarnessEvent(rule.id, agentRole, sessionKey, "requireApproval", "pending");
