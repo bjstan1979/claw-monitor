@@ -59,6 +59,11 @@
         "maximum": 1440,
         "default": 60
       },
+      "autoSteerOnStuck": {
+        "type": "boolean",
+        "default": true,
+        "description": "When a subagent is stuck (no activity for stuckThresholdMinutes), automatically steer it with a nudge message instead of just alerting. Second stuck detection escalates to alert only (no repeat steer)."
+      },
       "harnessEnabled": {
         "type": "boolean",
         "default": true

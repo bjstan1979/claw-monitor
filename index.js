@@ -142,6 +142,7 @@ function getConfig(pluginConfig) {
     alertCheckIntervalMs: (pluginConfig?.alertCheckIntervalSeconds || 30) * 1000,
     checkpointRefreshIntervalMs: (pluginConfig?.checkpointRefreshIntervalSeconds || 15) * 1000,
     orphanGraceMs: (pluginConfig?.orphanGraceMinutes || 60) * 60000,
+    autoSteerOnStuck: pluginConfig?.autoSteerOnStuck !== false,
   };
 }
 
@@ -3218,11 +3219,39 @@ async function checkAlerts(config, logger) {
         if (staleMs > config.stuckThresholdMs && !entry._stuckAlerted) {
           const idleConfirmation = confirmIdleBeforeStuckAlert(key, entry, filePath, staleMs, config);
           if (idleConfirmation.shouldAlert) {
-            await pushAlert(idleConfirmation.level, key,
-              `Subagent "${entry.label || entry.agentId}" (${key}) appears STUCK — no activity for ${formatElapsed(staleMs)}. Last tool: check with subagent_watch. Consider subagent_kill or subagent_steer.`
-            );
-            entry._stuckAlerted = true;
-            logger.info(`[claw-monitor] Stuck alert pushed: ${key} (${idleConfirmation.reason})`);
+            // --- Auto-steer on first stuck detection ---
+            if (config.autoSteerOnStuck && !entry._autoSteeredAt) {
+              const steerMessage = `检测到你长时间无输出。请立即总结当前进度，列出已完成和未完成的工作，然后announce结果。`;
+              const steerText = `[CLAW-MONITOR AUTO-STEER] ${steerMessage}`;
+              try {
+                const method = await injectIntoSession(apiRef, key, steerText, `auto-steer-${key}-${Date.now()}`);
+                entry._autoSteeredAt = Date.now();
+                logger.info(`[claw-monitor] Auto-steered stuck subagent: ${key} (method=${method}, stale=${formatElapsed(staleMs)})`);
+                logHarnessEvent("auto-steer-on-stuck", entry.agentId, key, "auto_steer", `Steered stuck subagent after ${formatElapsed(staleMs)} idle (method=${method})`);
+                // Push a lower-severity info alert so main agent is aware
+                await pushAlert("info", key,
+                  `Subagent "${entry.label || entry.agentId}" (${key}) auto-steered after ${formatElapsed(staleMs)} of inactivity. If still stuck, will escalate to warning.`
+                );
+                // Don't set _stuckAlerted yet — give the steer time to work
+                // Next check cycle will re-evaluate
+              } catch (err) {
+                logger.warn(`[claw-monitor] Auto-steer failed for ${key}: ${err instanceof Error ? err.message : String(err)}`);
+                logHarnessEvent("auto-steer-on-stuck", entry.agentId, key, "auto_steer_failed", `Steer failed: ${err instanceof Error ? err.message : String(err)}`);
+                // Fall through to normal stuck alert
+                await pushAlert(idleConfirmation.level, key,
+                  `Subagent "${entry.label || entry.agentId}" (${key}) appears STUCK — no activity for ${formatElapsed(staleMs)}. Auto-steer failed. Consider subagent_kill or subagent_steer.`
+                );
+                entry._stuckAlerted = true;
+              }
+            } else {
+              // Already auto-steered once or auto-steer disabled — escalate to warning alert
+              const steerNote = entry._autoSteeredAt ? ` Auto-steer was sent at ${new Date(entry._autoSteeredAt).toISOString()} but subagent is still stuck.` : "";
+              await pushAlert(idleConfirmation.level, key,
+                `Subagent "${entry.label || entry.agentId}" (${key}) appears STUCK — no activity for ${formatElapsed(staleMs)}.${steerNote} Consider subagent_kill or subagent_steer.`
+              );
+              entry._stuckAlerted = true;
+              logger.info(`[claw-monitor] Stuck alert pushed: ${key} (${idleConfirmation.reason})${steerNote}`);
+            }
           } else {
             entry._stuckAlerted = false;
             entry._lastStuckSuppressedAt = now;
@@ -3231,6 +3260,10 @@ async function checkAlerts(config, logger) {
         }
         if (staleMs <= config.stuckThresholdMs) {
           entry._stuckAlerted = false;
+          // If subagent became active again after auto-steer, reset so it can be steered again if stuck later
+          if (entry._autoSteeredAt && staleMs < config.stuckThresholdMs * 0.5) {
+            entry._autoSteeredAt = null;
+          }
         }
       } catch {}
     }
@@ -3279,6 +3312,218 @@ async function checkAlerts(config, logger) {
       }
     }
   }
+}
+
+// --- Auto-spawn on context-overflow-block ---
+// When context-overflow-block triggers, automatically spawn a child subagent
+// to continue the blocked agent's work, using checkpoint data for context.
+async function autoSpawnOnContextOverflow(sessionKey, agentRole, metrics, api) {
+  const contextUsage = metrics.contextUsage || 0;
+  api.logger.info(`[HARNESS] auto-spawn triggered for session=${sessionKey} agent=${agentRole} context=${contextUsage}%`);
+
+  // 1. Read checkpoint for the blocked session
+  const checkpoint = readCheckpoint(sessionKey);
+  const tracked = subagentTracker.get(sessionKey);
+
+  // 2. Extract progress info from checkpoint and tracker
+  const task = checkpoint?.task || tracked?.task || tracked?.label || "";
+  const completedSteps = checkpoint?.progress?.completedSteps || [];
+  const remainingSteps = checkpoint?.progress?.remainingSteps || [];
+  const writtenFiles = checkpoint?.progress?.writtenFiles || [];
+  const editedFiles = checkpoint?.progress?.editedFiles || [];
+  const readFiles = checkpoint?.progress?.readFiles || [];
+  const lastToolCall = checkpoint?.progress?.lastToolCall || tracked?.progress?.lastToolCall || null;
+  const lastError = checkpoint?.progress?.lastError || null;
+
+  // 3. Also try to infer progress from JSONL if checkpoint is stale or missing
+  const agentId = resolveAgentIdFromSessionKey(sessionKey);
+  const sessionId = resolveSessionIdFromSessionKey(sessionKey);
+  const jsonlPath = findJsonlFile(agentId, sessionId);
+  let inferredProgress = null;
+  if (jsonlPath) {
+    inferredProgress = inferProgressFromJsonl(jsonlPath, task);
+  }
+
+  // Merge: prefer checkpoint data, fill gaps with inferred
+  const finalCompletedSteps = completedSteps.length > 0 ? completedSteps : (inferredProgress?.completedSteps || []);
+  const finalRemainingSteps = remainingSteps.length > 0 ? remainingSteps : (inferredProgress?.remainingSteps || []);
+
+  // 4. Construct continuation task description
+  const contextParts = [];
+  contextParts.push(`[Context Overflow 自动接续] 前一个session因上下文耗尽(${contextUsage}%)被block，现在自动spawn接续。`);
+  if (task) {
+    contextParts.push(`原始任务: ${task}`);
+  }
+  if (finalCompletedSteps.length > 0) {
+    contextParts.push(`已完成步骤: ${finalCompletedSteps.join(" → ")}`);
+  }
+  if (finalRemainingSteps.length > 0) {
+    contextParts.push(`剩余步骤: ${finalRemainingSteps.join(" → ")}`);
+  }
+  const allWrittenFiles = [...new Set([...writtenFiles, ...editedFiles])];
+  if (allWrittenFiles.length > 0) {
+    contextParts.push(`已产出文件: ${allWrittenFiles.join(", ")}`);
+  }
+  if (readFiles.length > 0) {
+    contextParts.push(`已读取文件: ${readFiles.slice(0, 10).join(", ")}`);
+  }
+  if (lastToolCall) {
+    contextParts.push(`最后工具调用: ${lastToolCall}`);
+  }
+  if (lastError) {
+    contextParts.push(`最后错误: ${lastError}`);
+  }
+  contextParts.push(`请从断点继续，不要重复已完成的工作。`);
+
+  const continuationTask = contextParts.join("\n");
+  const extraSystemPrompt = `[Context Overflow 接续] 你的前一个session因上下文耗尽被自动block并接续。请从断点继续执行任务，不要重复已完成的工作。`;
+
+  // 5. Determine the agentId for the spawned subagent
+  // Map agentRole back to agentId for spawning
+  const roleToAgentId = {
+    main: "main",
+    coder: "coder",
+    researcher: "researcher",
+    media: "media",
+    news: "news",
+    doctor: "doctor",
+  };
+  const spawnAgentId = roleToAgentId[agentRole] || agentRole || agentId;
+
+  // 6. Generate sessionKey for the new subagent
+  const newSessionKey = `agent:${spawnAgentId}:subagent:${crypto.randomUUID()}`;
+
+  // 7. Spawn the subagent
+  let spawnResult = null;
+  let spawnError = null;
+  try {
+    spawnResult = await api.runtime.subagent.run({
+      sessionKey: newSessionKey,
+      message: continuationTask,
+      extraSystemPrompt,
+    });
+  } catch (err) {
+    spawnError = err instanceof Error ? err.message : String(err);
+    api.logger.warn(`[HARNESS] auto-spawn failed: ${spawnError}`);
+  }
+
+  const runId = spawnResult?.runId || "";
+
+  // 8. Add to tracker
+  subagentTracker.set(newSessionKey, {
+    childSessionKey: newSessionKey,
+    agentId: spawnAgentId,
+    task: task || "(context-overflow接续)",
+    label: `context-overflow-接续: ${(task || "").slice(0, 60)}`,
+    mode: "auto-spawn",
+    startedAt: Date.now(),
+    endedAt: null,
+    outcome: null,
+    error: null,
+    runId,
+    parentSessionKey: sessionKey,
+    metadata: {
+      _autoSpawnReason: "context-overflow-block",
+      _originalSessionKey: sessionKey,
+      _contextUsage: contextUsage,
+    },
+    progress: null,
+    totalCostUsd: 0,
+    totalTokens: 0,
+    _stuckAlerted: false,
+    _durationAlerted: false,
+    _costAlerted: false,
+    _tokenAlerted: false,
+    _errorSpikeAlerted: false,
+    _workingDir: process.cwd(),
+    _dirSnapshot: null,
+    runSummary: null,
+    fileChanges: null,
+  });
+
+  // 9. Write initial checkpoint for the new subagent
+  writeCheckpoint(newSessionKey, {
+    version: 1,
+    sessionKey: newSessionKey,
+    agentId: spawnAgentId,
+    task: task || "(context-overflow接续)",
+    label: `context-overflow-接续: ${(task || "").slice(0, 60)}`,
+    parentSessionKey: sessionKey,
+    createdAt: new Date().toISOString(),
+    updatedAt: new Date().toISOString(),
+    type: "intermediate",
+    outcome: "running",
+    progress: {
+      writtenFiles: allWrittenFiles,
+      editedFiles: [],
+      readFiles: readFiles.slice(0, 10),
+      keyCommands: [],
+      lastToolCall: lastToolCall || null,
+      hasErrors: !!lastError,
+      lastError: lastError || null,
+      completedSteps: finalCompletedSteps,
+      remainingSteps: finalRemainingSteps,
+    },
+    metadata: {
+      _autoSpawnReason: "context-overflow-block",
+      _originalSessionKey: sessionKey,
+      _contextUsage: contextUsage,
+    },
+  });
+
+  // 10. Log the auto-spawn event
+  logHarnessEvent("context-overflow-block", agentRole, sessionKey, "auto_spawn",
+    spawnError ? `spawn_failed: ${spawnError}` : `spawned: ${newSessionKey} runId=${runId}`
+  );
+
+  api.logger.info(`[HARNESS] auto-spawn ${spawnError ? "FAILED" : "OK"}: original=${sessionKey} new=${newSessionKey} agent=${spawnAgentId} runId=${runId}`);
+
+  // 11. Notify main session
+  if (mainSessionKey) {
+    const notifyParts = [
+      `[HARNESS Context Overflow 自动接续]`,
+      `被block的session: ${sessionKey} (agent=${agentRole}, context=${contextUsage}%)`,
+    ];
+    if (spawnError) {
+      notifyParts.push(`自动spawn失败: ${spawnError}`);
+      notifyParts.push(`请手动spawn子agent继续任务。接续任务描述:`);
+      notifyParts.push(continuationTask);
+    } else {
+      notifyParts.push(`已自动spawn接续子agent: ${newSessionKey} (agent=${spawnAgentId})`);
+      if (finalCompletedSteps.length > 0) {
+        notifyParts.push(`已完成: ${finalCompletedSteps.join(", ")}`);
+      }
+      if (finalRemainingSteps.length > 0) {
+        notifyParts.push(`剩余: ${finalRemainingSteps.join(", ")}`);
+      }
+      if (allWrittenFiles.length > 0) {
+        notifyParts.push(`已产出文件: ${allWrittenFiles.join(", ")}`);
+      }
+    }
+    const notifyText = notifyParts.join("\n");
+    await injectIntoSession(api, mainSessionKey, notifyText, `auto-spawn-notify-${sessionKey}-${Date.now()}`);
+
+    // Also try to wake the main session via heartbeat
+    try {
+      if (api.runtime?.system?.requestHeartbeat) {
+        api.runtime.system.requestHeartbeat({
+          source: "claw-monitor",
+          intent: "auto-spawn-notify",
+          reason: `context-overflow auto-spawn for ${sessionKey}`,
+          sessionKey: mainSessionKey,
+        });
+      }
+    } catch (hbErr) {
+      api.logger.warn(`[HARNESS] auto-spawn heartbeat wake failed: ${hbErr instanceof Error ? hbErr.message : String(hbErr)}`);
+    }
+  }
+
+  return {
+    spawned: !spawnError,
+    newSessionKey,
+    runId,
+    error: spawnError,
+  };
 }
 
 // --- Plugin entry ---
@@ -3333,6 +3578,7 @@ module.exports = definePluginEntry({
         _costAlerted: false,
         _tokenAlerted: false,
         _errorSpikeAlerted: false,
+        _autoSteeredAt: null, // timestamp of auto-steer, null = not yet steered
         _workingDir: process.cwd(),
         _dirSnapshot: null,
         runSummary: null,
@@ -3733,6 +3979,16 @@ module.exports = definePluginEntry({
           const blockReason = interpolateTemplate(actionConfig.blockReason || "Blocked by harness rule: " + rule.id, metrics);
           logHarnessEvent(rule.id, agentRole, sessionKey, "block", "blocked");
           api.logger.info(`[HARNESS] blocked tool=${event.toolName} rule=${rule.id} agent=${agentRole} reason=${blockReason}`);
+
+          // --- Auto-spawn on context-overflow-block ---
+          if (rule.id === "context-overflow-block") {
+            try {
+              await autoSpawnOnContextOverflow(sessionKey, agentRole, metrics, api);
+            } catch (spawnErr) {
+              api.logger.warn(`[HARNESS] auto-spawn on context-overflow-block failed: ${spawnErr instanceof Error ? spawnErr.message : String(spawnErr)}`);
+            }
+          }
+
           return { block: true, blockReason };
         }
 
