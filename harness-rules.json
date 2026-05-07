@@ -1,0 +1,62 @@
+{
+  "version": 1,
+  "defaultAction": "pass",
+  "rules": [
+    {
+      "id": "context-overflow-warning",
+      "name": "Context Overflow Warning",
+      "agentRoles": ["main", "coder", "researcher", "media", "news"],
+      "hook": "before_tool_call",
+      "trigger": { "contextUsage": { "gt": 70 } },
+      "action": "requireApproval",
+      "actionConfig": {
+        "title": "Context Usage High",
+        "description": "Context usage is at {{contextUsage}}%. Consider wrapping up or delegating to a sub-agent.",
+        "severity": "warning",
+        "timeoutMs": 30000,
+        "timeoutBehavior": "allow"
+      },
+      "enabled": true
+    },
+    {
+      "id": "context-overflow-block",
+      "name": "Context Overflow Block",
+      "agentRoles": ["main", "coder"],
+      "hook": "before_tool_call",
+      "trigger": { "contextUsage": { "gt": 90 } },
+      "action": "block",
+      "actionConfig": {
+        "blockReason": "Context usage at {{contextUsage}}%. Task too large for single session. Please delegate to sub-agent."
+      },
+      "enabled": true
+    },
+    {
+      "id": "tool-burst-protection",
+      "name": "Tool Burst Protection",
+      "agentRoles": ["main"],
+      "hook": "before_tool_call",
+      "trigger": { "toolCallCountInWindow": { "gt": 50, "windowMinutes": 10 } },
+      "action": "requireApproval",
+      "actionConfig": {
+        "title": "High Tool Call Rate",
+        "description": "{{toolCallCount}} tool calls in the last 10 minutes. Is this intentional?",
+        "severity": "info",
+        "timeoutMs": 15000,
+        "timeoutBehavior": "allow"
+      },
+      "enabled": true
+    },
+    {
+      "id": "long-session-check",
+      "name": "Long Session Check",
+      "agentRoles": ["main", "coder", "researcher"],
+      "hook": "before_prompt_build",
+      "trigger": { "sessionDurationMinutes": { "gt": 60 } },
+      "action": "pass",
+      "actionConfig": {
+        "appendContext": "Session has been running for {{sessionDurationMinutes}} minutes. Consider checkpointing progress."
+      },
+      "enabled": true
+    }
+  ]
+}

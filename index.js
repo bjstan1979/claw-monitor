@@ -14,6 +14,13 @@ const agentHealthStats = new Map(); // agentId -> { runs: [{outcome, duration, c
 const retryCounter = new Map(); // sessionKey -> retry count for auto-retry
 let pendingRestartNotification = null; // deferred restart notification text, injected once mainSessionKey is captured
 
+// --- Harness state ---
+let harnessConfig = null;        // parsed harness-rules.json
+let harnessConfigMtime = 0;      // mtime of harness-rules.json for cache invalidation
+const harnessSessionMetrics = new Map(); // sessionKey -> { toolCallTimestamps: [], turnCount: 0, startedAt: number, errorCount: 0 }
+const harnessPendingNotifications = []; // { sessionKey, text, ts, urgency: "high"|"normal" }
+const harnessLog = [];           // { ts, ruleId, agentId, sessionKey, action, result }
+
 // --- Helpers ---
 function resolveOpenclawDir() {
   return process.env.OPENCLAW_DIR || path.join(os.homedir(), ".openclaw");
@@ -651,6 +658,253 @@ function isCommandSafe(cmd) {
   }
   if (/[;&`$]/.test(cmd)) return false;
   return true;
+}
+
+// --- Harness config loader ---
+function loadHarnessConfig() {
+  const configPath = path.join(__dirname, "harness-rules.json");
+  try {
+    const stat = fs.statSync(configPath);
+    if (harnessConfig && stat.mtimeMs === harnessConfigMtime) {
+      return harnessConfig;
+    }
+    const content = fs.readFileSync(configPath, "utf-8");
+    const config = JSON.parse(content);
+    harnessConfig = config;
+    harnessConfigMtime = stat.mtimeMs;
+    return config;
+  } catch {
+    return null;
+  }
+}
+
+// --- Harness context usage estimator ---
+function estimateContextUsage(sessionKey) {
+  const meta = getSessionMetaFromSessionsJson(sessionKey);
+  if (meta?.totalTokens) {
+    const contextWindow = 170000;
+    return Math.min(99, Math.round((meta.totalTokens / contextWindow) * 100));
+  }
+  const agentId = resolveAgentIdFromSessionKey(sessionKey);
+  const sessionId = resolveSessionIdFromSessionKey(sessionKey);
+  const jsonlPath = findJsonlFile(agentId, sessionId);
+  if (jsonlPath) {
+    try {
+      const stat = fs.statSync(jsonlPath);
+      const estimatedTokens = Math.round((stat.size / 1024) * 300);
+      const contextWindow = 170000;
+      return Math.min(99, Math.round((estimatedTokens / contextWindow) * 100));
+    } catch {}
+  }
+  return 0;
+}
+
+// --- Harness session metrics tracker ---
+function getOrCreateSessionMetrics(sessionKey) {
+  if (!harnessSessionMetrics.has(sessionKey)) {
+    harnessSessionMetrics.set(sessionKey, {
+      toolCallTimestamps: [],
+      turnCount: 0,
+      startedAt: Date.now(),
+      errorCount: 0,
+    });
+  }
+  return harnessSessionMetrics.get(sessionKey);
+}
+
+function recordToolCall(sessionKey) {
+  const metrics = getOrCreateSessionMetrics(sessionKey);
+  metrics.toolCallTimestamps.push(Date.now());
+  const cutoff = Date.now() - 3600000;
+  metrics.toolCallTimestamps = metrics.toolCallTimestamps.filter(ts => ts >= cutoff);
+}
+
+function recordTurn(sessionKey) {
+  const metrics = getOrCreateSessionMetrics(sessionKey);
+  metrics.turnCount++;
+}
+
+function recordError(sessionKey) {
+  const metrics = getOrCreateSessionMetrics(sessionKey);
+  metrics.errorCount++;
+}
+
+function getSessionMetrics(sessionKey) {
+  const metrics = getOrCreateSessionMetrics(sessionKey);
+  const now = Date.now();
+  return {
+    contextUsage: estimateContextUsage(sessionKey),
+    toolCallCount: metrics.toolCallTimestamps.length,
+    toolCallCountInWindow: (windowMinutes) => {
+      const cutoff = now - windowMinutes * 60000;
+      return metrics.toolCallTimestamps.filter(ts => ts >= cutoff).length;
+    },
+    turnCount: metrics.turnCount,
+    sessionDurationMinutes: (now - metrics.startedAt) / 60000,
+    errorCount: metrics.errorCount,
+  };
+}
+
+// --- Harness rule evaluator ---
+function evaluateCondition(condition, metrics) {
+  for (const [field, spec] of Object.entries(condition)) {
+    let value;
+    if (field === "toolCallCountInWindow") {
+      const windowMinutes = spec.windowMinutes || 10;
+      value = metrics.toolCallCountInWindow(windowMinutes);
+      const compareSpec = {};
+      for (const [op, v] of Object.entries(spec)) {
+        if (op !== "windowMinutes") compareSpec[op] = v;
+      }
+      if (!compareNumeric(value, compareSpec)) return false;
+      continue;
+    }
+    value = metrics[field];
+    if (value === undefined || value === null) return false;
+    if (typeof spec === "object") {
+      if (!compareNumeric(value, spec)) return false;
+    } else {
+      if (value !== spec) return false;
+    }
+  }
+  return true;
+}
+
+function compareNumeric(value, spec) {
+  if (spec.gt !== undefined && !(value > spec.gt)) return false;
+  if (spec.lt !== undefined && !(value < spec.lt)) return false;
+  if (spec.gte !== undefined && !(value >= spec.gte)) return false;
+  if (spec.lte !== undefined && !(value <= spec.lte)) return false;
+  if (spec.eq !== undefined && value !== spec.eq) return false;
+  return true;
+}
+
+function evaluateHarnessRules(agentRole, metrics, hookName) {
+  const config = loadHarnessConfig();
+  if (!config || !config.rules) return null;
+
+  const matchingRules = config.rules.filter(rule => {
+    if (rule.enabled === false) return false;
+    if (!rule.agentRoles || !rule.agentRoles.includes(agentRole)) return false;
+    if (rule.hook && rule.hook !== hookName) return false;
+    if (!evaluateCondition(rule.trigger, metrics)) return false;
+    return true;
+  });
+
+  if (matchingRules.length === 0) return null;
+
+  const priority = { block: 3, requireApproval: 2, pass: 1 };
+  matchingRules.sort((a, b) => (priority[b.action] || 0) - (priority[a.action] || 0));
+
+  return matchingRules[0];
+}
+
+function interpolateTemplate(template, metrics) {
+  return template.replace(/\{\{(\w+)\}\}/g, (_, key) => {
+    const value = metrics[key];
+    if (value === undefined || value === null) return "N/A";
+    if (typeof value === "number" && !Number.isInteger(value)) return value.toFixed(1);
+    return String(value);
+  });
+}
+
+function logHarnessEvent(ruleId, agentId, sessionKey, action, result) {
+  const entry = {
+    ts: Date.now(),
+    ruleId,
+    agentId,
+    sessionKey,
+    action,
+    result,
+  };
+  harnessLog.push(entry);
+  if (harnessLog.length > 1000) harnessLog.shift();
+
+  try {
+    const logPath = path.join(resolveOpenclawDir(), "harness-log.jsonl");
+    fs.appendFileSync(logPath, JSON.stringify(entry) + "\n");
+  } catch {}
+}
+
+function resolveAgentRole(sessionKey, ctx) {
+  const agentId = ctx?.agentId || resolveAgentIdFromSessionKey(sessionKey || "");
+  if (agentId === "main" || agentId === "葱花") return "main";
+  if (agentId === "coder" || agentId === "程序员") return "coder";
+  if (agentId === "researcher" || agentId === "研究员") return "researcher";
+  if (agentId === "media" || agentId === "多媒体专员") return "media";
+  if (agentId === "news" || agentId === "新闻员") return "news";
+  return agentId;
+}
+
+// --- Harness tool creation ---
+function createHarnessStatusTool() {
+  return {
+    name: "harness_status",
+    description: "Show current harness rule evaluation status, active rules, and session metrics.",
+    inputSchema: {
+      type: "object",
+      properties: {
+        sessionKey: { type: "string", description: "Session key to check (optional, defaults to current)" },
+      },
+    },
+    async execute(params) {
+      const config = loadHarnessConfig();
+      if (!config) {
+        return { content: [{ type: "text", text: "Harness config not loaded (harness-rules.json missing or invalid)." }] };
+      }
+      const parts = [];
+      parts.push(`Harness version: ${config.version || 1}`);
+      parts.push(`Default action: ${config.defaultAction || "pass"}`);
+      parts.push(`Rules: ${config.rules?.length || 0}`);
+      for (const rule of (config.rules || [])) {
+        const status = rule.enabled === false ? "DISABLED" : "enabled";
+        parts.push(`  - ${rule.id} [${status}] action=${rule.action} agents=${(rule.agentRoles || []).join(",")}`);
+      }
+      parts.push(`\nSession metrics tracked: ${harnessSessionMetrics.size}`);
+      if (params?.sessionKey && harnessSessionMetrics.has(params.sessionKey)) {
+        const metrics = getSessionMetrics(params.sessionKey);
+        parts.push(`  Session ${params.sessionKey}:`);
+        parts.push(`    contextUsage: ${metrics.contextUsage}%`);
+        parts.push(`    toolCallCount: ${metrics.toolCallCount}`);
+        parts.push(`    turnCount: ${metrics.turnCount}`);
+        parts.push(`    sessionDuration: ${metrics.sessionDurationMinutes.toFixed(1)}min`);
+        parts.push(`    errorCount: ${metrics.errorCount}`);
+      }
+      parts.push(`\nPending notifications: ${harnessPendingNotifications.length}`);
+      parts.push(`Recent log entries: ${harnessLog.length}`);
+      return { content: [{ type: "text", text: parts.join("\n") }] };
+    },
+  };
+}
+
+function createHarnessLogTool() {
+  return {
+    name: "harness_log",
+    description: "Show recent harness evaluation log entries.",
+    inputSchema: {
+      type: "object",
+      properties: {
+        limit: { type: "number", description: "Max entries to show (default 20)", minimum: 1, maximum: 100 },
+        ruleId: { type: "string", description: "Filter by rule ID" },
+      },
+    },
+    async execute(params) {
+      const limit = params?.limit || 20;
+      let entries = [...harnessLog].reverse();
+      if (params?.ruleId) {
+        entries = entries.filter(e => e.ruleId === params.ruleId);
+      }
+      entries = entries.slice(0, limit);
+      if (entries.length === 0) {
+        return { content: [{ type: "text", text: "No harness log entries." }] };
+      }
+      const lines = entries.map(e => {
+        const ts = new Date(e.ts).toISOString();
+        return `[${ts}] ${e.ruleId} agent=${e.agentId} action=${e.action} result=${e.result}`;
+      });
+      return { content: [{ type: "text", text: lines.join("\n") }] };
+    },
+  };
 }
 
 // --- Progress inference from JSONL transcript ---
@@ -2969,6 +3223,8 @@ module.exports = definePluginEntry({
     api.registerTool(createSubagentOnAlertTool(), { optional: true });
     api.registerTool(createSubagentPipelineTool(api), { optional: true });
     api.registerTool(createSubagentCheckpointTool(), { optional: true });
+    api.registerTool(createHarnessStatusTool(), { optional: true });
+    api.registerTool(createHarnessLogTool(), { optional: true });
 
 	    // Register background alert checker service
 	    api.registerService(createAlertCheckerService(config, api.logger));
@@ -3294,6 +3550,23 @@ module.exports = definePluginEntry({
           api.logger.warn(`[claw-monitor] deferred restart notify failed: ${err instanceof Error ? err.message : String(err)}`);
         }
       }
+
+      // --- Harness: append rule-based context ---
+      try {
+        const harnessSessionKey = ctx?.sessionKey || "";
+        const agentRole = resolveAgentRole(harnessSessionKey, ctx);
+        const metrics = getSessionMetrics(harnessSessionKey);
+        const rule = evaluateHarnessRules(agentRole, metrics, "before_prompt_build");
+
+        if (rule && rule.action === "pass" && rule.actionConfig?.appendContext) {
+          const contextText = interpolateTemplate(rule.actionConfig.appendContext, metrics);
+          logHarnessEvent(rule.id, agentRole, harnessSessionKey, "pass", "injected");
+          api.logger.info(`[HARNESS] before_prompt_build: appended context for rule=${rule.id} agent=${agentRole}`);
+          return { appendContext: `[HARNESS] ${contextText}` };
+        }
+      } catch (err) {
+        api.logger.warn(`[HARNESS] before_prompt_build harness error: ${err instanceof Error ? err.message : String(err)}`);
+      }
     });
 
     // Hook: heartbeat_prompt_contribution — periodic status during idle
@@ -3350,6 +3623,95 @@ module.exports = definePluginEntry({
       }
 
       return { appendContext: `[Claw Monitor] ${parts.join(". ")}` };
+    });
+
+    // Hook: before_tool_call — evaluate harness rules for tool calls
+    api.on("before_tool_call", async (event, ctx) => {
+      try {
+        const sessionKey = ctx?.sessionKey || "";
+        const agentRole = resolveAgentRole(sessionKey, ctx);
+
+        recordToolCall(sessionKey);
+        recordTurn(sessionKey);
+
+        const metrics = getSessionMetrics(sessionKey);
+        const rule = evaluateHarnessRules(agentRole, metrics, "before_tool_call");
+
+        if (!rule) return;
+
+        const actionConfig = rule.actionConfig || {};
+
+        if (rule.action === "block") {
+          const blockReason = interpolateTemplate(actionConfig.blockReason || "Blocked by harness rule: " + rule.id, metrics);
+          logHarnessEvent(rule.id, agentRole, sessionKey, "block", "blocked");
+          api.logger.info(`[HARNESS] blocked tool=${event.toolName} rule=${rule.id} agent=${agentRole} reason=${blockReason}`);
+          return { block: true, blockReason };
+        }
+
+        if (rule.action === "requireApproval") {
+          const title = interpolateTemplate(actionConfig.title || "Harness Approval Required", metrics);
+          const description = interpolateTemplate(actionConfig.description || `Rule ${rule.id} requires approval for tool ${event.toolName}.`, metrics);
+          logHarnessEvent(rule.id, agentRole, sessionKey, "requireApproval", "pending");
+          api.logger.info(`[HARNESS] requireApproval tool=${event.toolName} rule=${rule.id} agent=${agentRole}`);
+          return {
+            requireApproval: {
+              title,
+              description,
+              severity: actionConfig.severity || "warning",
+              timeoutMs: actionConfig.timeoutMs || 30000,
+              timeoutBehavior: actionConfig.timeoutBehavior || "allow",
+              pluginId: "claw-monitor",
+              onResolution: (decision) => {
+                const result = decision === "allow-once" || decision === "allow-always" ? "approved" : "rejected";
+                logHarnessEvent(rule.id, agentRole, sessionKey, "requireApproval", result);
+                api.logger.info(`[HARNESS] approval result=${result} rule=${rule.id} tool=${event.toolName}`);
+              },
+            },
+          };
+        }
+
+        logHarnessEvent(rule.id, agentRole, sessionKey, "pass", "passed");
+      } catch (err) {
+        api.logger.warn(`[HARNESS] before_tool_call error: ${err instanceof Error ? err.message : String(err)}`);
+      }
+    });
+
+    // Hook: message_sending — inject urgent harness notifications into outgoing messages
+    api.on("message_sending", async (event, ctx) => {
+      try {
+        const sessionKey = ctx?.sessionKey || "";
+        if (!sessionKey) return;
+
+        const pending = harnessPendingNotifications.filter(n => n.sessionKey === sessionKey);
+        if (pending.length === 0) return;
+
+        for (const n of pending) {
+          const idx = harnessPendingNotifications.indexOf(n);
+          if (idx >= 0) harnessPendingNotifications.splice(idx, 1);
+        }
+
+        const notifyText = pending
+          .map(n => `[HARNESS] ${n.text}`)
+          .join("\n");
+        const newContent = notifyText + "\n---\n" + event.content;
+
+        api.logger.info(`[HARNESS] message_sending: injected ${pending.length} urgent notifications for session=${sessionKey}`);
+        return { content: newContent };
+      } catch (err) {
+        api.logger.warn(`[HARNESS] message_sending error: ${err instanceof Error ? err.message : String(err)}`);
+      }
+    });
+
+    // Hook: after_tool_call — track errors and update metrics
+    api.on("after_tool_call", async (event, ctx) => {
+      try {
+        const sessionKey = ctx?.sessionKey || "";
+        if (event.error) {
+          recordError(sessionKey);
+        }
+      } catch (err) {
+        api.logger.warn(`[HARNESS] after_tool_call error: ${err instanceof Error ? err.message : String(err)}`);
+      }
     });
   }
 });

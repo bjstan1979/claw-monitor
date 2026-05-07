@@ -58,6 +58,23 @@
         "minimum": 5,
         "maximum": 1440,
         "default": 60
+      },
+      "harnessEnabled": {
+        "type": "boolean",
+        "default": true
+      },
+      "harnessRulesPath": {
+        "type": "string",
+        "default": "harness-rules.json"
+      },
+      "harnessLogEnabled": {
+        "type": "boolean",
+        "default": true
+      },
+      "harnessDefaultAction": {
+        "type": "string",
+        "default": "pass",
+        "enum": ["pass", "requireApproval", "block"]
       }
     }
   },
@@ -71,7 +88,9 @@
       "subagent_steer",
       "subagent_on_alert",
       "subagent_pipeline",
-      "subagent_checkpoint"
+      "subagent_checkpoint",
+      "harness_status",
+      "harness_log"
     ]
   }
 }
