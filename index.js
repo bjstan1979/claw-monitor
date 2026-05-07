@@ -3082,7 +3082,7 @@ async function discoverAbortedSubagentsAndNotifyMain(config, logger, api) {
       if (!mapping) continue;
       for (const [key, val] of Object.entries(mapping)) {
         if (!key.includes(":subagent:") && !key.includes(":dashboard:") && !key.includes(":cron:")) continue;
-        if (val.abortedLastRun === true || val.status === "failed" || val.status === "timeout") {
+        if (val.abortedLastRun === true || val.status === "failed" || val.status === "timeout" || val.status === "running") {
           const cp = readCheckpoint(key);
 
           // Skip if checkpoint is already finalized — the session was properly handled before
