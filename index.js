@@ -17,6 +17,8 @@ let pendingRestartNotification = null; // deferred restart notification text, in
 // --- Harness state ---
 let harnessConfig = null;        // parsed harness-rules.json
 let harnessConfigMtime = 0;      // mtime of harness-rules.json for cache invalidation
+let ironLawsConfig = null;       // parsed iron-laws.json
+let ironLawsConfigMtime = 0;     // mtime of iron-laws.json for cache invalidation
 const harnessSessionMetrics = new Map(); // sessionKey -> { toolCallTimestamps: [], turnCount: 0, startedAt: number, errorCount: 0 }
 const harnessPendingNotifications = []; // { sessionKey, text, ts, urgency: "high"|"normal" }
 const harnessLog = [];           // { ts, ruleId, agentId, sessionKey, action, result }
@@ -676,6 +678,48 @@ function loadHarnessConfig() {
   } catch {
     return null;
   }
+}
+
+// --- Iron laws loader ---
+function loadIronLaws() {
+  const configPath = path.join(__dirname, "iron-laws.json");
+  try {
+    const stat = fs.statSync(configPath);
+    if (ironLawsConfig && stat.mtimeMs === ironLawsConfigMtime) {
+      return ironLawsConfig;
+    }
+    const content = fs.readFileSync(configPath, "utf-8");
+    const config = JSON.parse(content);
+    ironLawsConfig = config;
+    ironLawsConfigMtime = stat.mtimeMs;
+    return config;
+  } catch {
+    return null;
+  }
+}
+
+function buildIronLawsText(agentRole) {
+  const laws = loadIronLaws();
+  if (!laws || !laws.ironLaws) return null;
+
+  const universal = laws.ironLaws.universal || [];
+  const roleLaws = laws.ironLaws.roles || {};
+  const roleSpecific = roleLaws[agentRole] || null;
+
+  // Replace rule 2 ("做完必交付") with role-specific rule if exists
+  const effective = [];
+  for (let i = 0; i < universal.length; i++) {
+    if (i === 1 && roleSpecific) {
+      effective.push(roleSpecific);
+    } else {
+      effective.push(universal[i]);
+    }
+  }
+
+  if (effective.length === 0) return null;
+
+  const lines = effective.map((law, idx) => `${idx + 1}. ${law}`);
+  return `[HARNESS 铁律] 以下规则优先级最高，每轮必须遵守:\n${lines.join("\n")}`;
 }
 
 // --- Harness context window lookup from openclaw.json ---
@@ -3583,18 +3627,30 @@ module.exports = definePluginEntry({
         }
       }
 
-      // --- Harness: append rule-based context ---
+      // --- Harness: inject iron laws + rule-based context ---
       try {
         const harnessSessionKey = ctx?.sessionKey || "";
         const agentRole = resolveAgentRole(harnessSessionKey, ctx);
         const metrics = getSessionMetrics(harnessSessionKey);
-        const rule = evaluateHarnessRules(agentRole, metrics, "before_prompt_build");
 
+        // Always inject iron laws
+        const ironLawsText = buildIronLawsText(agentRole);
+
+        // Also check for rule-based context (long session, etc.)
+        const rule = evaluateHarnessRules(agentRole, metrics, "before_prompt_build");
+        let ruleContext = "";
         if (rule && rule.action === "pass" && rule.actionConfig?.appendContext) {
-          const contextText = interpolateTemplate(rule.actionConfig.appendContext, metrics);
+          ruleContext = interpolateTemplate(rule.actionConfig.appendContext, metrics);
           logHarnessEvent(rule.id, agentRole, harnessSessionKey, "pass", "injected");
           api.logger.info(`[HARNESS] before_prompt_build: appended context for rule=${rule.id} agent=${agentRole}`);
-          return { appendContext: `[HARNESS] ${contextText}` };
+        }
+
+        const parts = [];
+        if (ironLawsText) parts.push(ironLawsText);
+        if (ruleContext) parts.push(`[HARNESS] ${ruleContext}`);
+
+        if (parts.length > 0) {
+          return { appendContext: parts.join("\n\n") };
         }
       } catch (err) {
         api.logger.warn(`[HARNESS] before_prompt_build harness error: ${err instanceof Error ? err.message : String(err)}`);
