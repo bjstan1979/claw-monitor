@@ -2705,12 +2705,31 @@ async function discoverAbortedSubagentsAndNotifyMain(config, logger, api) {
         if (!key.includes(":subagent:") && !key.includes(":dashboard:") && !key.includes(":cron:")) continue;
         if (val.abortedLastRun === true || val.status === "failed" || val.status === "timeout") {
           const cp = readCheckpoint(key);
+
+          // Skip if checkpoint is already finalized — the session was properly handled before
+          if (cp && cp.type === "final") continue;
+
+          // Skip if we already notified about this session in a previous restart
+          if (cp && cp.restartNotifiedAt) continue;
+
+          // Skip sessions that are too old (subagents: 24h, cron/dashboard: 2h — they run frequently)
+          const isCronOrDashboard = key.includes(":cron:") || key.includes(":dashboard:");
+          const maxAgeMs = isCronOrDashboard ? 2 * 60 * 60 * 1000 : 24 * 60 * 60 * 1000;
+          const lastActive = new Date(val.lastInteractionAt || val.updatedAt || val.startedAt || cp?.createdAt || 0).getTime();
+          if (lastActive && Date.now() - lastActive > maxAgeMs) continue;
+
           const taskDesc = cp?.task || cp?.label || val.label || "未知任务";
           const agent = cp?.agentId || resolveAgentIdFromSessionKey(key) || agentId;
           const completedSteps = cp?.progress?.completedSteps || [];
           const remainingSteps = cp?.progress?.remainingSteps || [];
           const writtenFiles = cp?.progress?.writtenFiles || [];
           abortedSubagents.push({ key, agent, task: taskDesc, completedSteps, remainingSteps, writtenFiles });
+
+          // Mark as notified to prevent re-reporting on subsequent restarts
+          if (cp) {
+            cp.restartNotifiedAt = new Date().toISOString();
+            writeCheckpoint(key, cp);
+          }
         }
       }
     }
