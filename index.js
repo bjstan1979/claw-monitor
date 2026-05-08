@@ -19,7 +19,7 @@ let harnessConfig = null;        // parsed harness-rules.json
 let harnessConfigMtime = 0;      // mtime of harness-rules.json for cache invalidation
 let ironLawsConfig = null;       // parsed iron-laws.json
 let ironLawsConfigMtime = 0;     // mtime of iron-laws.json for cache invalidation
-const harnessSessionMetrics = new Map(); // sessionKey -> { toolCallTimestamps: [], turnCount: 0, startedAt: number, errorCount: 0 }
+const harnessSessionMetrics = new Map(); // sessionKey -> { toolCallTimestamps: [], turnCount: 0, startedAt: number, errorCounts: Map<string,number> }
 const contextWarningCooldown = new Map(); // sessionKey -> lastWarningTimestamp (5-min cooldown for context-overflow-warning)
 const harnessPendingNotifications = []; // { sessionKey, text, ts, urgency: "high"|"normal" }
 const harnessLog = [];           // { ts, ruleId, agentId, sessionKey, action, result }
@@ -905,7 +905,7 @@ function getOrCreateSessionMetrics(sessionKey) {
       toolCallTimestamps: [],
       turnCount: 0,
       startedAt: Date.now(),
-      errorCount: 0,
+      errorCounts: new Map(), // key: "toolName:errorType" -> count
     });
   }
   return harnessSessionMetrics.get(sessionKey);
@@ -923,14 +923,38 @@ function recordTurn(sessionKey) {
   metrics.turnCount++;
 }
 
-function recordError(sessionKey) {
+/**
+ * Extract an error type key from a tool error.
+ * Tries to pull HTTP status code, error code, or a short keyword from the error message.
+ */
+function extractErrorType(error) {
+  if (!error) return "unknown";
+  const errStr = String(error);
+  // Try HTTP status code like 432, 429, 500
+  const httpMatch = errStr.match(/\b(4\d{2}|5\d{2})\b/);
+  if (httpMatch) return httpMatch[1];
+  // Try common error keywords
+  const kwMatch = errStr.match(/(timeout|rate.?limit|not.?found|permission|auth|quota|network|ECONNREFUSED|ENOTFOUND|ETIMEDOUT)/i);
+  if (kwMatch) return kwMatch[1].toLowerCase().replace(/[^a-z]/g, "");
+  // Fallback: first 30 chars of error message, normalized
+  return errStr.slice(0, 30).replace(/[^a-zA-Z0-9]/g, "_").toLowerCase();
+}
+
+function recordError(sessionKey, toolName, error) {
   const metrics = getOrCreateSessionMetrics(sessionKey);
-  metrics.errorCount++;
+  const errorType = extractErrorType(error);
+  const key = `${toolName || "unknown"}:${errorType}`;
+  metrics.errorCounts.set(key, (metrics.errorCounts.get(key) || 0) + 1);
 }
 
 function getSessionMetrics(sessionKey) {
   const metrics = getOrCreateSessionMetrics(sessionKey);
   const now = Date.now();
+  // Compute max error count across all (toolName:errorType) groups
+  let maxErrorCount = 0;
+  for (const count of metrics.errorCounts.values()) {
+    if (count > maxErrorCount) maxErrorCount = count;
+  }
   return {
     contextUsage: estimateContextUsage(sessionKey),
     toolCallCount: metrics.toolCallTimestamps.length,
@@ -940,7 +964,8 @@ function getSessionMetrics(sessionKey) {
     },
     turnCount: metrics.turnCount,
     sessionDurationMinutes: (now - metrics.startedAt) / 60000,
-    errorCount: metrics.errorCount,
+    errorCount: maxErrorCount, // max across all groups for backward compat
+    errorCounts: metrics.errorCounts, // full Map for per-group access
   };
 }
 
@@ -954,6 +979,28 @@ function evaluateCondition(condition, metrics) {
       const compareSpec = {};
       for (const [op, v] of Object.entries(spec)) {
         if (op !== "windowMinutes") compareSpec[op] = v;
+      }
+      if (!compareNumeric(value, compareSpec)) return false;
+      continue;
+    }
+    if (field === "errorCountByGroup") {
+      // Per-group error count: check the count for the current tool's error groups
+      // metrics.currentToolName is set by before_tool_call hook
+      const toolName = metrics.currentToolName || "unknown";
+      const errorCounts = metrics.errorCounts; // Map<string,number>
+      let maxCount = 0;
+      if (errorCounts) {
+        for (const [key, count] of errorCounts.entries()) {
+          // Only count errors for the current tool
+          if (key.startsWith(toolName + ":")) {
+            if (count > maxCount) maxCount = count;
+          }
+        }
+      }
+      value = maxCount;
+      const compareSpec = {};
+      for (const [op, v] of Object.entries(spec)) {
+        compareSpec[op] = v;
       }
       if (!compareNumeric(value, compareSpec)) return false;
       continue;
@@ -1068,7 +1115,15 @@ function createHarnessStatusTool() {
         parts.push(`    toolCallCount: ${metrics.toolCallCount}`);
         parts.push(`    turnCount: ${metrics.turnCount}`);
         parts.push(`    sessionDuration: ${metrics.sessionDurationMinutes.toFixed(1)}min`);
-        parts.push(`    errorCount: ${metrics.errorCount}`);
+        parts.push(`    errorCount: ${metrics.errorCount} (max across groups)`);
+        if (metrics.errorCounts && metrics.errorCounts.size > 0) {
+          const groupEntries = [];
+          for (const [k, v] of metrics.errorCounts.entries()) {
+            groupEntries.push(`      ${k}: ${v}`);
+          }
+          parts.push(`    errorCounts by group:`);
+          parts.push(groupEntries.join("\n"));
+        }
       }
       parts.push(`\nPending notifications: ${harnessPendingNotifications.length}`);
       parts.push(`Recent log entries: ${harnessLog.length}`);
@@ -4110,6 +4165,7 @@ module.exports = definePluginEntry({
         recordTurn(sessionKey);
 
         const metrics = getSessionMetrics(sessionKey);
+        metrics.currentToolName = event.toolName || "unknown"; // for per-group error count evaluation
         const rule = evaluateHarnessRules(agentRole, metrics, "before_tool_call");
 
         if (!rule) return;
@@ -4259,7 +4315,7 @@ module.exports = definePluginEntry({
       try {
         const sessionKey = ctx?.sessionKey || "";
         if (event.error) {
-          recordError(sessionKey);
+          recordError(sessionKey, event.toolName || "unknown", event.error);
         }
       } catch (err) {
         api.logger.warn(`[HARNESS] after_tool_call error: ${err instanceof Error ? err.message : String(err)}`);

@@ -97,7 +97,7 @@
     },
     {
       "id": "error-retry-limit",
-      "name": "Error Retry Limit",
+      "name": "Error Retry Limit (Per-Tool Per-Error)",
       "agentRoles": [
         "main",
         "coder",
@@ -105,14 +105,14 @@
       ],
       "hook": "before_tool_call",
       "trigger": {
-        "errorCount": {
-          "gt": 3
+        "errorCountByGroup": {
+          "gte": 6
         }
       },
       "action": "requireApproval",
       "actionConfig": {
-        "title": "Repeated Tool Errors",
-        "description": "{{errorCount}} tool errors recorded. Possible retry loop — continue?",
+        "title": "Repeated Tool Errors (Same Tool+Error)",
+        "description": "The current tool has failed 6+ times with the same error type. Possible retry loop — consider switching tools or approach. Continue?",
         "severity": "warning",
         "timeoutMs": 30000,
         "timeoutBehavior": "deny"
