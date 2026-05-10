@@ -3212,7 +3212,21 @@ async function discoverAbortedSubagentsAndNotifyMain(config, logger, api) {
       if (!mapping) continue;
       for (const [key, val] of Object.entries(mapping)) {
         if (!key.includes(":subagent:") && !key.includes(":dashboard:") && !key.includes(":cron:")) continue;
-        if (val.abortedLastRun === true || val.status === "failed" || val.status === "timeout" || val.status === "running") {
+        // Condition 1: explicitly aborted/failed/timeout/running
+        const explicitAborted = val.abortedLastRun === true || val.status === "failed" || val.status === "timeout" || val.status === "running";
+
+        // Condition 2: stale unended session (no terminal status, no endedAt, but has activity timestamps)
+        // This catches cron/dashboard sessions that were "skipped stale" by discoverRunningSubagentsFromSessionsJson
+        // after a gateway restart — their status=null, abortedLastRun=null, endedAt=null.
+        const isCronOrDashboard = key.includes(":cron:") || key.includes(":dashboard:");
+        const isTerminal = isTerminalSessionStatus(val.status, val.endedAt);
+        const hasActivity = !!(val.lastInteractionAt || val.updatedAt || val.startedAt);
+        const staleMaxAgeMs = isCronOrDashboard ? 6 * 60 * 60 * 1000 : 24 * 60 * 60 * 1000; // cron: 6h, subagent: 24h
+        const lastActiveTs = normalizeTimestamp(val.lastInteractionAt) || normalizeTimestamp(val.updatedAt) || normalizeTimestamp(val.startedAt) || 0;
+        const withinStaleWindow = lastActiveTs && (Date.now() - lastActiveTs <= staleMaxAgeMs);
+        const staleUnended = !isTerminal && !val.endedAt && hasActivity && withinStaleWindow;
+
+        if (explicitAborted || staleUnended) {
           const cp = readCheckpoint(key);
 
           // Skip if checkpoint is already finalized — the session was properly handled before
@@ -3221,11 +3235,14 @@ async function discoverAbortedSubagentsAndNotifyMain(config, logger, api) {
           // Skip if we already notified about this session in a previous restart
           if (cp && cp.restartNotifiedAt) continue;
 
-          // Skip sessions that are too old (subagents: 24h, cron/dashboard: 2h — they run frequently)
-          const isCronOrDashboard = key.includes(":cron:") || key.includes(":dashboard:");
-          const maxAgeMs = isCronOrDashboard ? 2 * 60 * 60 * 1000 : 24 * 60 * 60 * 1000;
-          const lastActive = new Date(val.lastInteractionAt || val.updatedAt || val.startedAt || cp?.createdAt || 0).getTime();
+          // Skip sessions that are too old (subagents: 24h, cron/dashboard: 6h — they run frequently)
+          const maxAgeMs = isCronOrDashboard ? 6 * 60 * 60 * 1000 : 24 * 60 * 60 * 1000;
+          const lastActive = normalizeTimestamp(val.lastInteractionAt) || normalizeTimestamp(val.updatedAt) || normalizeTimestamp(val.startedAt) || normalizeTimestamp(cp?.createdAt) || 0;
           if (lastActive && Date.now() - lastActive > maxAgeMs) continue;
+
+          if (staleUnended) {
+            logger?.info?.(`[claw-monitor] detected stale unended session as aborted: ${key} status=${val.status || "null"} endedAt=${val.endedAt || "null"} lastActive=${new Date(lastActive).toISOString()}`);
+          }
 
           const taskDesc = cp?.task || cp?.label || val.label || "未知任务";
           const agent = cp?.agentId || resolveAgentIdFromSessionKey(key) || agentId;
