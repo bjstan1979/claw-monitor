@@ -67,20 +67,31 @@ function resolveSessionIdFromSessionKey(sessionKey) {
 
 // Load sessions.json for an agent, returning the key-value mapping
 // Caches in memory for performance
-const sessionsJsonCache = new Map(); // agentId -> { data, mtime }
+const sessionsJsonCache = new Map(); // agentId -> { data, mtime, cachedAt }
+const SESSIONS_JSON_CACHE_TTL_MS = 30 * 1000; // 30s TTL — sessions.json changes frequently during subagent runs
 function loadSessionsJson(agentId) {
   const openclawDir = resolveOpenclawDir();
   const filePath = path.join(openclawDir, "agents", agentId, "sessions", "sessions.json");
   try {
     const stat = fs.statSync(filePath);
     const cached = sessionsJsonCache.get(agentId);
-    if (cached && cached.mtime === stat.mtimeMs) return cached.data;
+    const now = Date.now();
+    // Cache hit: same mtime AND within TTL
+    if (cached && cached.mtime === stat.mtimeMs && (now - cached.cachedAt) < SESSIONS_JSON_CACHE_TTL_MS) return cached.data;
     const content = fs.readFileSync(filePath, "utf-8");
     const data = JSON.parse(content);
-    sessionsJsonCache.set(agentId, { data, mtime: stat.mtimeMs });
+    sessionsJsonCache.set(agentId, { data, mtime: stat.mtimeMs, cachedAt: now });
     return data;
   } catch {
     return null;
+  }
+}
+// Force-clear sessions.json cache (call on gateway restart or when stale data suspected)
+function clearSessionsJsonCache(agentId) {
+  if (agentId) {
+    sessionsJsonCache.delete(agentId);
+  } else {
+    sessionsJsonCache.clear();
   }
 }
 
@@ -272,6 +283,44 @@ function readRecentJsonlEvents(filePath, maxLines, maxBytes = 256 * 1024) {
     }
   } catch {}
   return [];
+}
+
+// Extract recent tool calls and key context from JSONL tail.
+// Used by autoSpawnOnContextOverflow to capture work done after last checkpoint.
+function extractRecentContextFromJsonl(filePath, maxEvents = 40) {
+  const events = readRecentJsonlEvents(filePath, maxEvents);
+  const recentToolCalls = [];
+  let lastAssistantText = "";
+  let lastUserText = "";
+
+  for (const evt of events) {
+    if (evt.type === "message" && evt.message) {
+      const msg = evt.message;
+      if (msg.role === "assistant" && msg.content) {
+        const text = extractTextContent(msg.content);
+        if (text.trim()) lastAssistantText = text.trim().slice(0, 300);
+      }
+      if (msg.role === "user" && msg.content) {
+        const text = extractTextContent(msg.content);
+        if (text.trim() && !isOpenClawInjectedUserMessage(text)) lastUserText = text.trim().slice(0, 200);
+      }
+    }
+    if (evt.type === "tool_call" || (evt.type === "message" && evt.message?.tool_calls)) {
+      const toolCalls = evt.message?.tool_calls || [evt];
+      for (const tc of toolCalls) {
+        const name = tc.function?.name || tc.name || "unknown";
+        if (recentToolCalls.length < 10) {
+          recentToolCalls.push(name);
+        }
+      }
+    }
+  }
+
+  return {
+    recentToolCalls,
+    lastAssistantText,
+    lastUserText
+  };
 }
 
 // Read the FIRST maxLines from a JSONL file (for step-plan extraction).
@@ -1240,7 +1289,7 @@ function stepsAreConsistent(existing, inferred) {
 
 function inferProgressFromJsonl(jsonlPath, taskDescription) {
   if (!jsonlPath || !fs.existsSync(jsonlPath)) {
-    return { completedSteps: [], remainingSteps: [], lastToolCall: null };
+    return { completedSteps: [], remainingSteps: [], lastToolCall: null, confidence: 0 };
   }
 
   // Strategy 1 needs early messages (step plans are declared throughout but start early),
@@ -1421,7 +1470,10 @@ function inferProgressFromJsonl(jsonlPath, taskDescription) {
       remainingSteps.length = 0;
       remainingSteps.push(uniqueSteps[uniqueSteps.length - 1].desc);
     }
-    return { completedSteps, remainingSteps, lastToolCall };
+    // Confidence: high if we have explicit completion markers, medium if inferred from ordering
+    const hasExplicitCompletion = completedNums.size > 0;
+    const confidence = hasExplicitCompletion ? 0.9 : (uniqueSteps.length >= 3 ? 0.7 : 0.5);
+    return { completedSteps, remainingSteps, lastToolCall, confidence };
   }
 
   // Strategy 2: Use ordered tool phases as completed steps
@@ -1441,7 +1493,10 @@ function inferProgressFromJsonl(jsonlPath, taskDescription) {
     if (hasWrite && !hasExec) remainingSteps.push("测试验证");
     if (hasMedia) remainingSteps.push("整合输出");
 
-    return { completedSteps, remainingSteps, lastToolCall };
+    // Confidence: tool-phase inference is less reliable than explicit step markers
+    // More phases seen = higher confidence; remaining steps are speculative
+    const confidence = toolPhaseOrder.length >= 3 ? 0.6 : 0.4;
+    return { completedSteps, remainingSteps, lastToolCall, confidence };
   }
 
   return { completedSteps: [], remainingSteps: [], lastToolCall };
@@ -1855,6 +1910,11 @@ function updateIntermediateCheckpoint(key, entry, now = Date.now(), force = fals
     if (inferred.lastToolCall) {
       intermediateProgress.lastToolCall = inferred.lastToolCall;
     }
+    // Track confidence — downstream consumers (auto-spawn, notifications) can use this
+    // to decide whether to trust the inferred progress or fall back to raw JSONL
+    if (inferred.confidence != null) {
+      intermediateProgress.confidence = inferred.confidence;
+    }
   }
 
   const metadata = { ...(entry.metadata || {}) };
@@ -1949,11 +2009,13 @@ async function finalizeSubagentCheckpoint(key, entry, api, options = {}) {
     let finalCompletedSteps;
     let finalRemainingSteps;
     let lastToolCall = null;
+    let progressConfidence = 0;
 
     if (hasExistingSteps) {
       // Re-run inference only for lastToolCall and remaining steps update
-      const inferred = filePath ? inferProgressFromJsonl(filePath, taskDesc) : { completedSteps: [], remainingSteps: [], lastToolCall: null };
+      const inferred = filePath ? inferProgressFromJsonl(filePath, taskDesc) : { completedSteps: [], remainingSteps: [], lastToolCall: null, confidence: 0 };
       lastToolCall = inferred.lastToolCall;
+      progressConfidence = inferred.confidence || 0;
       const isSuccessful = normalizeOutcome(entry.outcome) === "completed";
       finalCompletedSteps = isSuccessful
         ? [...(existingProgress.completedSteps || []), ...(existingProgress.remainingSteps || [])]
@@ -1961,8 +2023,9 @@ async function finalizeSubagentCheckpoint(key, entry, api, options = {}) {
       finalRemainingSteps = isSuccessful ? [] : [...(existingProgress.remainingSteps || [])];
     } else {
       // No existing steps — fall back to fresh inference
-      const inferred = filePath ? inferProgressFromJsonl(filePath, taskDesc) : { completedSteps: [], remainingSteps: [], lastToolCall: null };
+      const inferred = filePath ? inferProgressFromJsonl(filePath, taskDesc) : { completedSteps: [], remainingSteps: [], lastToolCall: null, confidence: 0 };
       lastToolCall = inferred.lastToolCall;
+      progressConfidence = inferred.confidence || 0;
       const isSuccessful = normalizeOutcome(entry.outcome) === "completed";
       finalCompletedSteps = isSuccessful
         ? [...(inferred.completedSteps || []), ...(inferred.remainingSteps || [])]
@@ -1979,7 +2042,8 @@ async function finalizeSubagentCheckpoint(key, entry, api, options = {}) {
       hasErrors: runSummary.hasErrors || false,
       lastError: entry.error || null,
       completedSteps: finalCompletedSteps,
-      remainingSteps: finalRemainingSteps
+      remainingSteps: finalRemainingSteps,
+      confidence: progressConfidence
     };
     entry.userStats = runSummary.userStats || entry.userStats || null;
   }
@@ -3535,8 +3599,12 @@ async function autoSpawnOnContextOverflow(sessionKey, agentRole, metrics, api) {
   const sessionId = resolveSessionIdFromSessionKey(sessionKey);
   const jsonlPath = findJsonlFile(agentId, sessionId);
   let inferredProgress = null;
+  let recentContext = null;
   if (jsonlPath) {
     inferredProgress = inferProgressFromJsonl(jsonlPath, task);
+    // Extract recent tool calls and context from JSONL tail — captures work
+    // done after last checkpoint was written (up to 60s gap)
+    recentContext = extractRecentContextFromJsonl(jsonlPath);
   }
 
   // Merge: prefer checkpoint data, fill gaps with inferred
@@ -3567,6 +3635,19 @@ async function autoSpawnOnContextOverflow(sessionKey, agentRole, metrics, api) {
   }
   if (lastError) {
     contextParts.push(`最后错误: ${lastError}`);
+  }
+  // Add recent context from JSONL tail — captures work done after last checkpoint
+  if (recentContext) {
+    if (recentContext.recentToolCalls.length > 0) {
+      contextParts.push(`最近工具调用: ${recentContext.recentToolCalls.join(", ")}`);
+    }
+    if (recentContext.lastAssistantText) {
+      contextParts.push(`前session最后输出: ${recentContext.lastAssistantText}`);
+    }
+  }
+  const progressConfidence = checkpoint?.progress?.confidence ?? inferredProgress?.confidence ?? 0;
+  if (progressConfidence < 0.6) {
+    contextParts.push(`⚠️ 进度推断置信度较低(${Math.round(progressConfidence * 100)}%)，请先检查已产出文件确认实际进度。`);
   }
   contextParts.push(`请从断点继续，不要重复已完成的工作。`);
 
@@ -3729,6 +3810,10 @@ module.exports = definePluginEntry({
   register(api) {
     const config = getConfig(api.pluginConfig);
     apiRef = api;
+
+    // Clear sessions.json cache on startup — after gateway restart, cached data is stale
+    clearSessionsJsonCache();
+    debugLog("sessions.json cache cleared on startup");
 
     api.registerTool(createSubagentStatusTool(config), { optional: true });
     api.registerTool(createSubagentWatchTool(config), { optional: true });
