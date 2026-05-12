@@ -1,4 +1,5 @@
 const { definePluginEntry } = require("openclaw/plugin-sdk/plugin-entry");
+const { enhanceCheckpointHooks, generateRecoveryPrompt } = require("./checkpoint-enhancer");
 const { execSync } = require("child_process");
 const fs = require("fs");
 const path = require("path");
@@ -3811,6 +3812,9 @@ module.exports = definePluginEntry({
     const config = getConfig(api.pluginConfig);
     apiRef = api;
 
+    // --- Checkpoint Enhancer: enhance subagent checkpoint progress info ---
+    enhanceCheckpointHooks(api);
+
     // Clear sessions.json cache on startup — after gateway restart, cached data is stale
     clearSessionsJsonCache();
     debugLog("sessions.json cache cleared on startup");
@@ -4194,7 +4198,7 @@ module.exports = definePluginEntry({
         if (ruleContext) parts.push(`[HARNESS] ${ruleContext}`);
 
         if (parts.length > 0) {
-          return { appendContext: parts.join("\n\n") };
+          return { appendSystemContext: parts.join("\n\n") };
         }
       } catch (err) {
         api.logger.warn(`[HARNESS] before_prompt_build harness error: ${err instanceof Error ? err.message : String(err)}`);
