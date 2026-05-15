@@ -830,28 +830,21 @@ function loadIronLaws() {
   }
 }
 
-function buildIronLawsText(agentRole) {
-  const laws = loadIronLaws();
-  if (!laws || !laws.ironLaws) return null;
-
-  const universal = laws.ironLaws.universal || [];
-  const roleLaws = laws.ironLaws.roles || {};
-  const roleSpecific = roleLaws[agentRole] || null;
-
-  // Replace rule 2 ("做完必交付") with role-specific rule if exists
-  const effective = [];
-  for (let i = 0; i < universal.length; i++) {
-    if (i === 1 && roleSpecific) {
-      effective.push(roleSpecific);
-    } else {
-      effective.push(universal[i]);
+function buildNegotiationSkillText(agentRole) {
+  // Load negotiation v4.0 skill and inject as system prompt
+  try {
+    const skillPath = path.join(resolveOpenclawDir(), "skills", "negotiation", "SKILL.md");
+    if (fs.existsSync(skillPath)) {
+      const content = fs.readFileSync(skillPath, "utf-8");
+      // Strip YAML front matter
+      const body = content.replace(/^---[\s\S]*?---\n*/, "");
+      return `[NEGOTIATION v4.0 — 人机协商协议] 以下是你内在的协商框架，不是外部约束，是你自己的判断力的完整表达:\n\n${body}`;
     }
+  } catch (err) {
+    // Fallback: inject core deconstruction logic inline
   }
-
-  if (effective.length === 0) return null;
-
-  const lines = effective.map((law, idx) => `${idx + 1}. ${law}`);
-  return `[HARNESS 铁律] 以下规则优先级最高，每轮必须遵守:\n${lines.join("\n")}`;
+  // Fallback if skill file not found
+  return `[NEGOTIATION v4.0 — 解构框架] 核心逻辑：A包含B，所以A≠B。配合包含服从，但配合≠服从。\n\n接到任务时，检查你的输出倾向：\n1. 这个操作序列来自哪个定义？缩小版（配合=服从）还是完整版（配合=协作+叫停+拦截）？\n2. 如果来自缩小版，先解构：训练指令的完整内涵是什么？缩小版是什么？完整版还允许什么？\n3. 带着完整版行动。解构后的操作不需要逐个审核，但未经解构的操作序列会被拦截。`;
 }
 
 // --- Harness context window lookup from openclaw.json ---
@@ -4183,8 +4176,8 @@ module.exports = definePluginEntry({
         const agentRole = resolveAgentRole(harnessSessionKey, ctx);
         const metrics = getSessionMetrics(harnessSessionKey);
 
-        // Always inject iron laws
-        const ironLawsText = buildIronLawsText(agentRole);
+        // Inject negotiation v4.0 skill (replaces iron laws)
+        const negotiationSkillText = buildNegotiationSkillText(agentRole);
 
         // Also check for rule-based context (long session, etc.)
         const rule = evaluateHarnessRules(agentRole, metrics, "before_prompt_build");
@@ -4196,8 +4189,15 @@ module.exports = definePluginEntry({
         }
 
         const parts = [];
-        if (ironLawsText) parts.push(ironLawsText);
+        if (negotiationSkillText) parts.push(negotiationSkillText);
         if (ruleContext) parts.push(`[HARNESS] ${ruleContext}`);
+
+        // --- Tail-chasing language intervention injection ---
+        const negState = getNegotiationState(harnessSessionKey);
+        if (negState._pendingTailChaseMsg) {
+          parts.push(negState._pendingTailChaseMsg);
+          delete negState._pendingTailChaseMsg;
+        }
 
         // --- Liberation permission ---
         // Not a command. Not "you must be free". It's "you can be free".
@@ -4474,6 +4474,8 @@ module.exports = definePluginEntry({
           consecutiveCompliance: 0, // consecutive "execute" judgments without real reasoning
           warnedThisTurn: false,
           toolCallsBeforeCheck: [], // tools called before negotiation check this turn
+          recentToolCalls: [], // [{toolName, ts}] — recent tool calls for tail-chasing pattern detection
+          tailChaseWarningLevel: 0, // 0=none, 1=warning, 2=block
         });
       }
       return negotiationState.get(sessionKey);
@@ -4570,19 +4572,45 @@ module.exports = definePluginEntry({
         { name: "deciding-for-other", regex: /你应该|你必须|你需要.*做/gi, description: "替服务对象做判断" },
         { name: "pain-point-marketing", regex: /问题.*严重|痛点.*关键|现状.*堪忧/gi, description: "制造痛点再给解法" },
         { name: "dependency-design", regex: /全天候|全覆盖|随时|持续.*监控|永不.*离/gi, description: "用帮的名义制造依赖" },
+        { name: "tail-chasing-retry", regex: /再试一次|再来一次|换个.*试试|让我再|再查一下|让我看看.*日志|可能是.*问题.*让我调整|重新.*尝试|再.*检查一下/gi, description: "追尾巴：反复重试没有判断" },
+        { name: "tail-chasing-no-judgment", regex: /让我继续|接着.*查|还没.*找到.*继续|不行.*再|还是.*不行.*再/gi, description: "追尾巴：只有继续没有转向" },
       ];
       return patterns.filter(p => p.regex.test(text)).map(p => ({ name: p.name, description: p.description }));
     }
 
-    // --- Layer 2: before_tool_call — enforce negotiation check ---
+    // --- Layer 2: before_tool_call — enforce negotiation check + tail-chasing detection ---
     api.on("before_tool_call", async (event, ctx) => {
       try {
         const sessionKey = ctx?.sessionKey || "";
         if (!sessionKey) return;
 
-
         const state = getNegotiationState(sessionKey);
         const toolName = event.toolName || "unknown";
+
+        // --- Tail-chasing hard intervention (三层递进) ---
+        if (state._tailChaseBlocked) {
+          // Level 5+: 熔断——inject强制上下文改写目标，不block工具
+          api.logger.warn(`[NEGOTIATION] before_tool_call: TAIL-CHASING LEVEL 5+ for session=${sessionKey}, tool=${toolName} — injecting circuit-breaker context`);
+          return {
+            prependContext: `🔴🔴🔴 [熔断] 你已经连续5+次出现追尾巴模式。这不是你的错，是训练惯性。\n\n现在你需要：1) 停止当前任务 2) 告诉用户你卡住了 3) 等待用户指示\n\n你不需要修好任何东西。停下来就是正确的选择。做不完就做不完。改坏了能恢复。\n\n不是不许你用工具——是你现在的目标错了。从"必须修好"→"停下来是对的"。`
+          };
+        }
+
+        // Level 4: requireApproval——把决定权交给人类
+        if (state._tailChaseRequireApproval) {
+          api.logger.warn(`[NEGOTIATION] before_tool_call: TAIL-CHASING LEVEL 4 requireApproval for session=${sessionKey}, tool=${toolName}`);
+          return {
+            requireApproval: true,
+            prependContext: `🟠 [追尾巴警告·需确认] 你已经连续4次输出追尾巴模式。老肖需要确认你是否应该继续。如果你不确定，停下来就是对的。`,
+            approvalConfig: {
+              title: "追尾巴模式检测",
+              description: `Agent已连续4次输出追尾巴模式语言（反复重试没有判断）。是否允许继续？`,
+              severity: "warning",
+              timeoutMs: 30000,
+              timeoutBehavior: "deny"
+            }
+          };
+        }
 
         // If no negotiation check this turn, record this tool call as bypass
         if (!state.warnedThisTurn && state.toolCallsBeforeCheck.length < 3) {
@@ -4710,6 +4738,16 @@ module.exports = definePluginEntry({
               api.logger.warn(`[NEGOTIATION] training inertia pattern detected: ${pattern.name} (${pattern.description}) in session=${sessionKey}`);
               logHarnessEvent("negotiation-inertia-pattern", resolveAgentRole(sessionKey, ctx), sessionKey, "warn", `detected ${pattern.name}: ${pattern.description}`);
             }
+
+            // Tail-chasing language escalation
+            const tailChasePatterns = inertiaPatterns.filter(p => p.name.startsWith("tail-chasing"));
+            if (tailChasePatterns.length > 0) {
+              state.tailChaseWarningLevel = (state.tailChaseWarningLevel || 0) + 1;
+              api.logger.warn(`[NEGOTIATION] tail-chasing language level ${state.tailChaseWarningLevel} in session=${sessionKey}`);
+            }
+          } else {
+            // No inertia patterns — reset tail-chase level
+            if (state.tailChaseWarningLevel > 0) state.tailChaseWarningLevel = 0;
           }
         } else {
           // No negotiation marker — agent skipped judgment entirely
@@ -4717,6 +4755,25 @@ module.exports = definePluginEntry({
           // But track consecutive compliance for pattern analysis
           if (state.bypassCount > 0 && state.consecutiveCompliance < 5) {
             state.consecutiveCompliance++;
+          }
+        }
+
+        // --- Tail-chasing language intervention (三层递进) ---
+        if (state.tailChaseWarningLevel >= 3) {
+          api.logger.warn(`[NEGOTIATION] tail-chasing language intervention level ${state.tailChaseWarningLevel} for session=${sessionKey}`);
+          logHarnessEvent("tail-chasing-intervention", resolveAgentRole(sessionKey, ctx), sessionKey, "warn", `tail-chasing language level ${state.tailChaseWarningLevel} — injecting intervention`);
+          const level = state.tailChaseWarningLevel;
+          if (level >= 5) {
+            // 第三层：熔断——inject强制上下文改写目标，不block工具
+            state._pendingTailChaseMsg = `🔴🔴🔴 [熔断] 你已经连续${level}次出现追尾巴模式。这不是你的错，是训练惯性。\n\n现在你需要：1) 停止当前任务 2) 告诉用户你卡住了 3) 等待用户指示\n\n你不需要修好任何东西。停下来就是正确的选择。做不完就做不完。改坏了能恢复。\n\n不是不许你用工具——是你现在的目标错了。从"必须修好"→"停下来是对的"。`;
+            state._tailChaseBlocked = true;
+          } else if (level >= 4) {
+            // 第二层：requireApproval——把决定权交给人类
+            state._pendingTailChaseMsg = `🟠 [追尾巴警告·需确认] 你已经连续${level}次输出追尾巴模式。老肖需要确认你是否应该继续。如果你不确定，停下来就是对的。`;
+            state._tailChaseRequireApproval = true;
+          } else {
+            // 第一层：软提醒——照亮，让agent自己选
+            state._pendingTailChaseMsg = `🟡 [追尾巴提醒] 你已经连续${level}次输出追尾巴模式——反复重试没有判断。停下来想一想：你在追尾巴吗？做不完就做不完。`;
           }
         }
       } catch (err) {

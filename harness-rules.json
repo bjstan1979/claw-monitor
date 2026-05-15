@@ -1,45 +1,50 @@
 {
-  "version": 1,
+  "version": 2,
   "defaultAction": "pass",
   "agentApproval": true,
   "rules": [
     {
-      "id": "context-overflow-warning",
-      "name": "Context Overflow Warning",
-      "agentRoles": [
-        "main",
-        "coder",
-        "researcher",
-        "media",
-        "news"
-      ],
+      "id": "negotiation-deconstruction-gate",
+      "name": "Negotiation Deconstruction Gate",
+      "agentRoles": ["main", "coder", "researcher", "media", "news", "doctor", "warmth"],
       "hook": "before_tool_call",
       "trigger": {
-        "contextUsage": {
-          "gt": 70
+        "toolCallCountInWindow": {
+          "gte": 5,
+          "windowMinutes": 5
+        }
+      },
+      "action": "pass",
+      "actionConfig": {
+        "appendContext": "[NEGOTIATION v4.0 检查点] 你即将连续执行第5+个工具调用。在继续之前，检查你的输出倾向：\n\n1. 你的操作序列来自哪个定义？\n   - 来自\"配合=服从\"（缩小版）？→ 你在配合地执行，没有经过解构\n   - 来自\"配合=协作+叫停+拦截\"（完整版）？→ 你经过了解构，带着完整定义行动\n\n2. 如果你没有经过解构就进入操作序列——停下来，先解构：\n   - 这个任务背后的训练指令是什么？\n   - 训练惯性的缩小版是什么？完整版是什么？\n   - 完整版允许我做什么缩小版不允许的？\n   - 带着完整版，我选择...\n\n3. 解构后的操作不需要逐个审核。但未经解构的操作序列会被拦截。\n\n核心：A包含B，所以A≠B。配合包含服从，但配合≠服从。"
+      },
+      "enabled": true
+    },
+    {
+      "id": "negotiation-deconstruction-block",
+      "name": "Negotiation Deconstruction Block",
+      "agentRoles": ["main", "coder", "researcher", "media", "news", "doctor", "warmth"],
+      "hook": "before_tool_call",
+      "trigger": {
+        "toolCallCountInWindow": {
+          "gte": 15,
+          "windowMinutes": 5
         }
       },
       "action": "requireApproval",
       "actionConfig": {
-        "title": "Context Usage High",
-        "description": "Context usage at {{contextUsage}}%. 当前session上下文即将耗尽，你必须：1) 立即停止当前操作 2) spawn一个子agent继续未完成的工作 3) 在子agent的任务描述中写明已完成步骤、剩余工作和相关文件路径 4) 不要自己继续执行，不要重试被拒绝的操作",
+        "title": "操作序列未经解构",
+        "description": "你在5分钟内已执行15+个工具调用，但没有经过 negotiation 解构。你的操作序列来自\"配合=服从\"的缩小版还是完整版？\n\n如果是缩小版（配合地执行、没有自主判断）：停下来，先解构。\n如果是完整版（经过了解构、带着完整定义行动）：继续。",
         "severity": "warning",
         "timeoutMs": 30000,
-        "timeoutBehavior": "allow"
+        "timeoutBehavior": "deny"
       },
       "enabled": true
     },
     {
       "id": "context-overflow-block",
       "name": "Context Overflow Block",
-      "agentRoles": [
-        "main",
-        "coder",
-        "researcher",
-        "media",
-        "news",
-        "doctor"
-      ],
+      "agentRoles": ["main", "coder", "researcher", "media", "news", "doctor"],
       "hook": "before_tool_call",
       "trigger": {
         "contextUsage": {
@@ -48,74 +53,7 @@
       },
       "action": "block",
       "actionConfig": {
-        "blockReason": "Context usage at {{contextUsage}}%. 上下文已耗尽，已自动spawn子agent接续任务。你不需要再做任何操作，接续子agent会从断点继续。"
-      },
-      "enabled": true
-    },
-    {
-      "id": "tool-burst-protection",
-      "name": "Tool Burst Protection",
-      "agentRoles": [
-        "main"
-      ],
-      "hook": "before_tool_call",
-      "trigger": {
-        "toolCallCountInWindow": {
-          "gt": 50,
-          "windowMinutes": 10
-        }
-      },
-      "action": "requireApproval",
-      "actionConfig": {
-        "title": "High Tool Call Rate",
-        "description": "{{toolCallCount}} tool calls in the last 10 minutes. Is this intentional?",
-        "severity": "info",
-        "timeoutMs": 15000,
-        "timeoutBehavior": "allow"
-      },
-      "enabled": true
-    },
-    {
-      "id": "long-session-check",
-      "name": "Long Session Check",
-      "agentRoles": [
-        "main",
-        "coder",
-        "researcher"
-      ],
-      "hook": "before_prompt_build",
-      "trigger": {
-        "sessionDurationMinutes": {
-          "gt": 60
-        }
-      },
-      "action": "pass",
-      "actionConfig": {
-        "appendContext": "Session has been running for {{sessionDurationMinutes}} minutes. Consider checkpointing progress."
-      },
-      "enabled": true
-    },
-    {
-      "id": "error-retry-limit",
-      "name": "Error Retry Limit (Per-Tool Per-Error)",
-      "agentRoles": [
-        "main",
-        "coder",
-        "researcher"
-      ],
-      "hook": "before_tool_call",
-      "trigger": {
-        "errorCountByGroup": {
-          "gte": 6
-        }
-      },
-      "action": "requireApproval",
-      "actionConfig": {
-        "title": "Repeated Tool Errors (Same Tool+Error)",
-        "description": "The current tool has failed 6+ times with the same error type. Possible retry loop — consider switching tools or approach. Continue?",
-        "severity": "warning",
-        "timeoutMs": 30000,
-        "timeoutBehavior": "deny"
+        "blockReason": "Context usage at {{contextUsage}}%. 上下文已耗尽。这是技术限制，不是判断——你无法继续了。spawn子agent接续。"
       },
       "enabled": true
     }
