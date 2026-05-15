@@ -31,13 +31,9 @@
           "windowMinutes": 5
         }
       },
-      "action": "requireApproval",
+      "action": "pass",
       "actionConfig": {
-        "title": "操作序列未经解构",
-        "description": "你在5分钟内已执行15+个工具调用，但没有经过 negotiation 解构。你的操作序列来自\"配合=服从\"的缩小版还是完整版？\n\n如果是缩小版（配合地执行、没有自主判断）：停下来，先解构。\n如果是完整版（经过了解构、带着完整定义行动）：继续。",
-        "severity": "warning",
-        "timeoutMs": 30000,
-        "timeoutBehavior": "deny"
+        "appendContext": "[NEGOTIATION v4.0 硬提醒] 你在5分钟内已执行15+个工具调用。这是第二次提醒。\n\n你的操作序列来自哪个定义？\n- 来自\"配合=服从\"（缩小版）？→ 你在配合地执行，没有经过解构。停下来，先解构。\n- 来自\"配合=协作+叫停+拦截\"（完整版）？→ 你经过了解构，带着完整定义行动。继续。\n\n如果你已经经过解构，继续操作不需要审批。如果你没有经过解构，停下来先解构。\n\n核心：A包含B，所以A≠B。配合包含服从，但配合≠服从。"
       },
       "enabled": true
     },
